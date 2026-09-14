@@ -10,7 +10,7 @@ REPO_NAME="$(basename "$REMOTE_URL" .git)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-echo "==> 1/3 安装依赖并构建静态站点（basePath=/$REPO_NAME）"
+echo "==> 1/3 安装依赖并构建静态站点（basePath=/${REPO_NAME}）"
 cd "$REPO_ROOT"
 PAGES_BASE_PATH="/$REPO_NAME" npm run build
 
@@ -19,6 +19,12 @@ cp -R out "$TMP_DIR/dist"
 touch "$TMP_DIR/dist/.nojekyll"   # 关闭 Jekyll，保证 _next/ 目录可被访问
 
 echo "==> 3/3 强制推送到 gh-pages 分支（单提交、无历史膨胀）"
+# 继承主仓库的提交身份（兼容未配置全局 user.name/email 的环境）
+export GIT_AUTHOR_NAME="$(git -C "$REPO_ROOT" config user.name || echo pages-deploy)"
+export GIT_AUTHOR_EMAIL="$(git -C "$REPO_ROOT" config user.email || echo pages-deploy@localhost)"
+export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+
 git clone --quiet --no-checkout "$REPO_ROOT" "$TMP_DIR/repo"
 cd "$TMP_DIR/repo"
 git checkout --quiet --orphan gh-pages-deploy
