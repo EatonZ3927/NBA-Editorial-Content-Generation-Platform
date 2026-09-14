@@ -1,39 +1,41 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { deleteDraft, listDrafts, type DraftRecord } from "@/lib/nba/store";
 
-export type DraftItem = {
-  id: number;
-  title: string;
-  body: string;
-  templateName: string | null;
-  tone: string | null;
-  length: string | null;
-  tags: string[] | null;
-  wordCount: number;
-  sourceSummary: string | null;
-  createdAt: string;
-};
+export type DraftItem = DraftRecord;
 
-export default function DraftList({ initial }: { initial: DraftItem[] }) {
-  const [items, setItems] = useState(initial);
-  const [openId, setOpenId] = useState<number | null>(initial[0]?.id ?? null);
+/**
+ * 草稿箱（纯前端版）：草稿保存在本浏览器 localStorage，
+ * 挂载时读取，删除即时生效；每个使用者的浏览器各自一份。
+ */
+export default function DraftList() {
+  const [items, setItems] = useState<DraftItem[]>([]);
+  const [openId, setOpenId] = useState<number | null>(null);
+  const [ready, setReady] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+
+  useEffect(() => {
+    const drafts = listDrafts();
+    setItems(drafts);
+    setOpenId(drafts[0]?.id ?? null);
+    setReady(true);
+  }, []);
 
   const flash = (msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(null), 1800);
   };
 
-  const remove = async (id: number) => {
-    const res = await fetch(`/api/drafts/${id}`, { method: "DELETE" });
-    if (res.ok) {
-      setItems((prev) => prev.filter((item) => item.id !== id));
-      flash("已删除");
-    } else {
-      flash("删除失败");
-    }
+  const remove = (id: number) => {
+    deleteDraft(id);
+    setItems((prev) => prev.filter((item) => item.id !== id));
+    flash("已删除");
   };
+
+  if (!ready) {
+    return <div className="panel p-10 text-center text-sm text-slate-500">正在读取本机草稿…</div>;
+  }
 
   const copy = async (item: DraftItem) => {
     try {
@@ -88,7 +90,7 @@ export default function DraftList({ initial }: { initial: DraftItem[] }) {
 
             {open ? (
               <div className="mt-3 space-y-3 border-t border-white/5 pt-3">
-                <pre className="scroll-thin max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-slate-950/60 p-3 text-[13px] leading-relaxed text-slate-200">
+                <pre className="scroll-thin max-h-96 overflow-auto whitespace-pre-wrap text-[13px] leading-relaxed text-slate-200">
                   {item.body}
                 </pre>
                 {item.tags && item.tags.length > 0 ? (

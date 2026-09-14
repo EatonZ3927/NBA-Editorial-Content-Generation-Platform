@@ -1,9 +1,9 @@
-import Link from "next/link";
-import { notFound } from "next/navigation";
-import { getPlayerProfile } from "@/lib/nba/service";
-import type { PlayerProfile, StatSplit } from "@/lib/nba/types";
+"use client";
 
-export const dynamic = "force-dynamic";
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { getPlayerProfile } from "@/lib/nba/store";
+import type { PlayerProfile, StatSplit } from "@/lib/nba/types";
 
 function n1(v: number | null | undefined) {
   return v === null || v === undefined || !Number.isFinite(v) ? "—" : String(Math.round(v * 10) / 10);
@@ -12,13 +12,54 @@ function pct(v: number | null | undefined) {
   return v === null || v === undefined || !Number.isFinite(v) ? "—" : `${(v * 100).toFixed(1)}%`;
 }
 
-export default async function PlayerPage({ params }: { params: Promise<{ espnId: string }> }) {
-  const { espnId } = await params;
-  if (!/^\d+$/.test(espnId)) notFound();
+/**
+ * 球员详情（纯前端版）：档案与生涯数据由本浏览器直连 ESPN 抓取，
+ * 结果缓存到本机 localStorage（30 分钟）。
+ */
+export default function PlayerProfileView({ espnId }: { espnId: string }) {
+  const [player, setPlayer] = useState<PlayerProfile | null>(null);
+  const [loading, setLoading] = useState(true);
 
-  const player: PlayerProfile | null = await getPlayerProfile(espnId).catch(() => null);
-  const bogus = !player || (player.fullName.startsWith("球员 #") && player.seasons.length === 0);
-  if (bogus) notFound();
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setPlayer(null);
+    getPlayerProfile(espnId)
+      .catch(() => null)
+      .then((p) => {
+        if (!alive) return;
+        setPlayer(p);
+        setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [espnId]);
+
+  if (loading) {
+    return (
+      <div className="panel flex items-center justify-center gap-3 p-12 text-sm text-slate-400">
+        <span className="h-5 w-5 animate-spin rounded-full border-2 border-orange-400 border-t-transparent" />
+        正在抓取球员档案与生涯数据…
+      </div>
+    );
+  }
+
+  const bogus = !player || (!player.fullName && player.seasons.length === 0);
+  if (bogus) {
+    return (
+      <div className="panel p-10 text-center">
+        <p className="text-sm text-slate-300">未找到该球员的数据。</p>
+        <p className="mt-2 text-xs text-slate-500">
+          可能是 ESPN ID 无效或数据源暂时不可用，请返回{" "}
+          <Link href="/players" className="text-orange-300 hover:text-orange-200">
+            球星检索
+          </Link>{" "}
+          重新选择。
+        </p>
+      </div>
+    );
+  }
 
   const regular = player.seasons.filter((s) => s.seasonType === "regular");
   const playoffs = player.seasons.filter((s) => s.seasonType === "playoffs");

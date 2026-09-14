@@ -2,6 +2,25 @@ import Link from "next/link";
 import type { GameSummary } from "@/lib/nba/types";
 import { teamShort, teamZh } from "@/lib/nba/teams";
 
+/**
+ * 本场热点球员标签：两队得分王优先，篮板/助攻王补充，去重后最多 3 个。
+ * 统一显示完整英文名（名 + 姓）。
+ */
+function hotPlayers(game: GameSummary): string[] {
+  const names: string[] = [];
+  const push = (side: "home" | "away", kind: string) => {
+    const leader = game[side].leaders.find((l) => l.name === kind);
+    if (leader && !names.includes(leader.athleteName)) names.push(leader.athleteName);
+  };
+  push("away", "points");
+  push("home", "points");
+  for (const kind of ["rebounds", "assists"]) {
+    push("away", kind);
+    push("home", kind);
+  }
+  return names.slice(0, 3);
+}
+
 function leaderText(game: GameSummary, side: "home" | "away", kind = "points") {
   const team = game[side];
   const leader = team.leaders.find((l) => l.name === kind) ?? team.leaders[0];
@@ -60,7 +79,11 @@ export default function GameCard({ game }: { game: GameSummary }) {
       ) : null}
 
       <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500">
-        {game.broadcast ? <span className="chip">📺 {game.broadcast}</span> : null}
+        {hotPlayers(game).map((name) => (
+          <span key={name} className="chip">
+            🔥 {name}
+          </span>
+        ))}
         {game.venue ? <span className="chip">📍 {game.venue}</span> : null}
         {game.series ? <span className="chip text-orange-300">{game.series}</span> : null}
         {game.odds?.overUnder ? <span className="chip">Σ {game.odds.overUnder}</span> : null}

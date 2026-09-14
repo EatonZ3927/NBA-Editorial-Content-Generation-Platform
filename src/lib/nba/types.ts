@@ -33,7 +33,10 @@ export type GameSummary = {
   away: GameTeam;
   venue: string | null;
   broadcast: string | null;
+  /** 系列赛比分，仅季后赛（seasonType = post）有值；常规赛/季前赛一律为 null */
   series: string | null;
+  /** 赛季阶段：pre=季前赛 regular=常规赛 post=季后赛 */
+  seasonType?: "pre" | "regular" | "post";
   odds: { detail: string; overUnder: number | null } | null;
   link: string | null;
 };
@@ -59,6 +62,10 @@ export type NewsResult = {
   source: DataSource;
   items: NewsItem[];
   fetchedAt: string;
+  /** 下一次自动刷新的时间（北京时间 00:00 / 12:00 边界），ISO 字符串 */
+  nextAutoRefreshAt?: string;
+  /** true 表示本次为手动刷新预览：数据未写入共享库，仅返回给当前请求者 */
+  manual?: boolean;
 };
 
 export type DataSource = "live" | "cache" | "offline";

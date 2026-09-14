@@ -1,30 +1,57 @@
+"use client";
+
 import Link from "next/link";
+import { useEffect, useState } from "react";
 import GameCard from "@/components/GameCard";
 import { currentNbaSeasonYear, seasonLabel } from "@/lib/nba/espn";
-import { getLeagueLeaders, getNews, getRecentBoard } from "@/lib/nba/service";
+import {
+  getLeagueLeaders,
+  getNews,
+  getRecentBoard,
+  listDrafts,
+} from "@/lib/nba/store";
 import { STAR_PICKS } from "@/lib/nba/teams";
 import { formatDateZh, relativeZh } from "@/lib/nba/dates";
-import { db } from "@/db";
-import { drafts } from "@/db/schema";
-import { desc } from "drizzle-orm";
-
-export const dynamic = "force-dynamic";
+import type { LeaderRow, NewsItem, ScoreboardResult } from "@/lib/nba/types";
 
 function n1(v: number | null | undefined) {
   return v === null || v === undefined ? "—" : String(Math.round(v * 10) / 10);
 }
 
-export default async function HomePage() {
+export default function HomePage() {
   const season = currentNbaSeasonYear();
-  const [board, news, leaders, recentDrafts] = await Promise.all([
-    getRecentBoard(),
-    getNews(6).catch(() => ({ items: [], source: "offline" as const, fetchedAt: "" })),
-    getLeagueLeaders(season, "pts").catch(() => ({ rows: [], source: "offline" as const })),
-    db.select().from(drafts).orderBy(desc(drafts.createdAt)).limit(4).catch(() => []),
-  ]);
+  const [board, setBoard] = useState<ScoreboardResult | null>(null);
+  const [news, setNews] = useState<NewsItem[]>([]);
+  const [leaders, setLeaders] = useState<{ rows: LeaderRow[]; season: number } | null>(null);
+  const [draftCount, setDraftCount] = useState(0);
 
-  const sourceBadge =
-    board.source === "live" ? "实时数据" : board.source === "cache" ? "本地缓存" : "离线";
+  // 纯前端版：所有数据在本浏览器内抓取（ESPN 公开接口 + localStorage 缓存）
+  useEffect(() => {
+    let alive = true;
+    setDraftCount(listDrafts().length);
+    (async () => {
+      const [b, n, l] = await Promise.all([
+        getRecentBoard().catch(() => null),
+        getNews(6).catch(() => null),
+        getLeagueLeaders(season, "pts").catch(() => null),
+      ]);
+      if (!alive) return;
+      setBoard(b);
+      setNews(n?.items ?? []);
+      setLeaders(l ? { rows: l.rows, season: l.season } : { rows: [], season });
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [season]);
+
+  const sourceBadge = !board
+    ? "加载中"
+    : board.source === "live"
+      ? "实时数据"
+      : board.source === "cache"
+        ? "本机缓存"
+        : "离线";
 
   return (
     <div className="space-y-8">
@@ -34,11 +61,21 @@ export default async function HomePage() {
         <div className="relative">
           <span className="chip">Sports Desk · 编辑效率工具</span>
           <h1 className="mt-4 max-w-3xl text-[clamp(1.8rem,4vw,2.9rem)] font-black leading-tight text-white">
-            一站式 NBA 内容工作台：
-            <span className="bg-gradient-to-r from-orange-400 to-sky-300 bg-clip-text text-transparent">
-              自动写文案、查球星历史数据、盯当日比分与新闻
-            </span>
+            一站式 NBA 内容工作台
           </h1>
+          <p className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-[clamp(1rem,2vw,1.4rem)] font-bold tracking-wide">
+            <span className="bg-gradient-to-r from-orange-400 to-sky-300 bg-clip-text text-transparent">
+              自动写文案
+            </span>
+            <span className="h-1 w-1 rounded-full bg-slate-500" />
+            <span className="bg-gradient-to-r from-orange-400 to-sky-300 bg-clip-text text-transparent">
+              查球星历史数据
+            </span>
+            <span className="h-1 w-1 rounded-full bg-slate-500" />
+            <span className="bg-gradient-to-r from-orange-400 to-sky-300 bg-clip-text text-transparent">
+              盯当日比分与新闻
+            </span>
+          </p>
           <p className="mt-4 max-w-2xl text-sm leading-relaxed text-slate-400">
             选择比赛或球员，系统自动抽取真实比分、分赛季数据、命中率与近期状态，按 9 种文体 × 5 种语气 × 3 种篇幅
             生成可直接发布的中文稿件，并可一键存入草稿箱。
@@ -58,7 +95,7 @@ export default async function HomePage() {
             <Stat label="文案模板" value="9" unit="种" />
             <Stat label="语气/篇幅" value="5 / 3" unit="组合" />
             <Stat label="赛季跨度" value="1979-今" unit="" />
-            <Stat label="草稿箱" value={String(recentDrafts.length)} unit="条最新" />
+            <Stat label="草稿箱" value={String(draftCount)} unit="条本机" />
           </dl>
         </div>
       </section>
@@ -67,11 +104,13 @@ export default async function HomePage() {
       <section className="space-y-4">
         <SectionHead
           title="最近比赛比分"
-          desc={`${formatDateZh(board.date)} · 共 ${board.games.length} 场 · ${sourceBadge}`}
+          desc={board ? `${formatDateZh(board.date)} · 共 ${board.games.length} 场 · ${sourceBadge}` : "正在加载…"}
           href="/scores"
           action="进入比分中心"
         />
-        {board.games.length === 0 ? (
+        {!board ? (
+          <p className="panel p-6 text-sm text-slate-400">正在抓取最新比分…</p>
+        ) : board.games.length === 0 ? (
           <p className="panel p-6 text-sm text-slate-400">当前日期暂无比赛数据，可前往比分中心手动选择日期。</p>
         ) : (
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -86,8 +125,8 @@ export default async function HomePage() {
         {/* 数据榜 */}
         <section className="space-y-4">
           <SectionHead
-            title={`${seasonLabel(season)} 赛季得分榜`}
-            desc={`NBA 官方联盟数据 · 前 ${Math.min(10, leaders.rows.length)} 名`}
+            title={`${seasonLabel(leaders?.season ?? season)} 赛季得分榜`}
+            desc={`ESPN 联盟数据榜 · 前 ${Math.min(10, leaders?.rows.length ?? 0)} 名`}
             href="/players"
             action="检索球员"
           />
@@ -106,7 +145,7 @@ export default async function HomePage() {
                 </tr>
               </thead>
               <tbody>
-                {leaders.rows.slice(0, 10).map((row) => (
+                {(leaders?.rows ?? []).slice(0, 10).map((row) => (
                   <tr key={row.espnId + row.rank}>
                     <td className="text-slate-500">{row.rank}</td>
                     <td className="font-semibold text-slate-100">{row.playerName}</td>
@@ -118,10 +157,10 @@ export default async function HomePage() {
                     <td>{row.fgp ? `${(row.fgp * 100).toFixed(1)}%` : "—"}</td>
                   </tr>
                 ))}
-                {leaders.rows.length === 0 ? (
+                {(leaders?.rows.length ?? 0) === 0 ? (
                   <tr>
                     <td colSpan={8} className="py-6 text-center text-slate-500">
-                      数据源暂不可用
+                      {leaders ? "数据源暂不可用" : "正在加载…"}
                     </td>
                   </tr>
                 ) : null}
@@ -132,9 +171,9 @@ export default async function HomePage() {
 
         {/* 新闻 */}
         <section className="space-y-4">
-          <SectionHead title="NBA 相关新闻" desc="ESPN 实时抓取" href="/news" action="更多新闻" />
+          <SectionHead title="NBA 相关新闻" desc="每 12 小时自动更新" href="/news" action="更多新闻" />
           <div className="panel divide-y divide-white/5">
-            {news.items.map((item) => (
+            {news.map((item) => (
               <a
                 key={item.id}
                 href={item.url ?? "#"}
@@ -161,8 +200,8 @@ export default async function HomePage() {
                 </span>
               </a>
             ))}
-            {news.items.length === 0 ? (
-              <p className="p-6 text-sm text-slate-500">暂无新闻数据</p>
+            {news.length === 0 ? (
+              <p className="p-6 text-sm text-slate-500">正在加载新闻…</p>
             ) : null}
           </div>
         </section>
@@ -175,7 +214,7 @@ export default async function HomePage() {
           {STAR_PICKS.map((star) => (
             <Link
               key={star.espnId}
-              href={`/players/${star.espnId}`}
+              href={`/player?id=${star.espnId}`}
               className="panel group flex items-center gap-3 p-3 transition hover:-translate-y-0.5 hover:border-orange-500/50"
             >
               {/* eslint-disable-next-line @next/next/no-img-element */}

@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getUserApiKey } from "@/components/KeySetup";
 import {
   LENGTHS,
   TEMPLATES,
@@ -10,6 +11,13 @@ import {
   type TemplateId,
   type ToneId,
 } from "@/lib/copy/engine";
+import { runGenerate } from "@/lib/copy/generate";
+import {
+  getNews,
+  getScoreboard,
+  saveDraft as persistDraft,
+  searchPlayers,
+} from "@/lib/nba/store";
 import CalendarPicker from "@/components/CalendarPicker";
 import { teamZh } from "@/lib/nba/teams";
 
@@ -48,10 +56,11 @@ export type CopyStudioInitial = {
 };
 
 export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) {
-  // 三种数据源可自由组合（0~3 个），由入口参数决定默认勾选
+  // 三种数据源可自由组合（0~3 个）：直接进入时全部不勾选，由用户自由选择；
+  // 从比分中心/新闻中心/球员页带参数跳入时，自动勾选对应数据源并预选对应内容
   const [sources, setSources] = useState<{ game: boolean; player: boolean; news: boolean }>({
     game: Boolean(initial.gameId),
-    player: Boolean(initial.espnId) || (!initial.gameId && !initial.newsId),
+    player: Boolean(initial.espnId),
     news: Boolean(initial.newsId),
   });
   const toggleSource = (key: "game" | "player" | "news") =>
@@ -93,10 +102,9 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
     let alive = true;
     (async () => {
       try {
-        const res = await fetch(`/api/scores?date=${gameDate}`);
-        const data = (await res.json()) as { games?: GameSummary[]; date?: string };
+        const board = await getScoreboard(gameDate);
         if (!alive) return;
-        setGames(data.games ?? []);
+        setGames(board.games);
       } catch {
         if (alive) setGames([]);
       }
@@ -110,10 +118,9 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
     let alive = true;
     (async () => {
       try {
-        const res = await fetch("/api/news?limit=40");
-        const data = (await res.json()) as { items?: NewsItem[] };
+        const news = await getNews(40);
         if (!alive) return;
-        setNewsItems(data.items ?? []);
+        setNewsItems(news.items);
       } catch {
         if (alive) setNewsItems([]);
       }
@@ -127,9 +134,7 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
     if (sources.player && playerQuery.trim().length === 0 && !espnId) {
       const timer = setTimeout(async () => {
         try {
-          const res = await fetch("/api/players?q=");
-          const data = (await res.json()) as { results?: PlayerHit[] };
-          setPlayerHits(data.results ?? []);
+          setPlayerHits(await searchPlayers(""));
         } catch {
           setPlayerHits([]);
         }
@@ -139,15 +144,35 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
     if (playerQuery.trim().length === 0) return;
     const timer = setTimeout(async () => {
       try {
-        const res = await fetch(`/api/players?q=${encodeURIComponent(playerQuery.trim())}`);
-        const data = (await res.json()) as { results?: PlayerHit[] };
-        setPlayerHits(data.results ?? []);
+        setPlayerHits(await searchPlayers(playerQuery.trim()));
       } catch {
         setPlayerHits([]);
       }
     }, 320);
     return () => clearTimeout(timer);
   }, [playerQuery, sources.player, espnId]);
+
+  // 从比分中心跳入时：把选中的比赛滚动到列表可视区居中（只执行一次）
+  const gameCenteredRef = useRef(false);
+  useEffect(() => {
+    if (gameCenteredRef.current) return;
+    if (!sources.game || !gameId || games.length === 0) return;
+    const el = document.getElementById(`game-option-${gameId}`);
+    if (!el) return;
+    gameCenteredRef.current = true;
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [sources.game, gameId, games]);
+
+  // 从新闻中心跳入时：新闻列表加载完成后，把选中的那条新闻滚动到列表可视区居中（只执行一次）
+  const newsCenteredRef = useRef(false);
+  useEffect(() => {
+    if (newsCenteredRef.current) return;
+    if (!sources.news || !newsId || newsItems.length === 0) return;
+    const el = document.getElementById(`news-option-${newsId}`);
+    if (!el) return;
+    newsCenteredRef.current = true;
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [sources.news, newsId, newsItems]);
 
   const selectedGame = useMemo(() => games.find((g) => g.id === gameId) ?? null, [games, gameId]);
   const selectedNews = useMemo(() => newsItems.find((n) => n.id === newsId) ?? null, [newsItems, newsId]);
@@ -158,23 +183,19 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
       setBusy(true);
       setError(null);
       try {
-        const res = await fetch("/api/generate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            template,
-            tone,
-            length,
-            keywords,
-            variant: v,
-            espnId: sources.player && espnId ? espnId : null,
-            gameId: sources.game && gameId ? gameId : null,
-            gameDate,
-            newsId: sources.news && newsId ? newsId : null,
-          }),
+        // 纯前端架构：直接在本浏览器内组装数据并请求 DashScope（BYOK）
+        const data = await runGenerate({
+          template,
+          tone,
+          length,
+          keywords,
+          variant: v,
+          espnId: sources.player && espnId ? espnId : null,
+          gameId: sources.game && gameId ? gameId : null,
+          gameDate,
+          newsId: sources.news && newsId ? newsId : null,
+          userApiKey: getUserApiKey() || null,
         });
-        const data = (await res.json()) as CopyResult & { error?: string };
-        if (data.error) throw new Error(data.error);
         setResult(data);
         setTitle(data.title);
         setBody(data.body);
@@ -195,21 +216,16 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
       return;
     }
     try {
-      const res = await fetch("/api/drafts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title: title || "未命名草稿",
-          body,
-          templateId: template,
-          templateName: TEMPLATES.find((t) => t.id === template)?.name,
-          tone,
-          length,
-          tags,
-          sourceSummary: result?.sourceSummary ?? "",
-        }),
+      // 草稿保存在本浏览器 localStorage（每个使用者各自一份）
+      persistDraft({
+        title: title || "未命名草稿",
+        body,
+        templateName: TEMPLATES.find((t) => t.id === template)?.name ?? null,
+        tone,
+        length,
+        tags,
+        sourceSummary: result?.sourceSummary ?? "",
       });
-      if (!res.ok) throw new Error("保存失败");
       flash("已保存到草稿箱");
     } catch (e) {
       setError((e as Error).message);
@@ -280,6 +296,7 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
                 {games.map((game) => (
                   <button
                     key={game.id}
+                    id={`game-option-${game.id}`}
                     onClick={() => setGameId(game.id)}
                     className={`w-full rounded-lg border px-2.5 py-2 text-left text-[12px] transition ${
                       gameId === game.id
@@ -334,7 +351,7 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
               {espnId ? (
                 <p className="text-[11px] text-slate-500">
                   已选：{playerName || espnId} ·{" "}
-                  <Link href={`/players/${espnId}`} className="text-orange-300 hover:text-orange-200">
+                  <Link href={`/player?id=${espnId}`} className="text-orange-300 hover:text-orange-200">
                     查看完整历史数据 ↗
                   </Link>
                 </p>
@@ -347,6 +364,7 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
               {newsItems.map((item) => (
                 <button
                   key={item.id}
+                  id={`news-option-${item.id}`}
                   onClick={() => setNewsId(item.id)}
                   className={`w-full rounded-lg border px-2.5 py-2 text-left text-[12px] transition ${
                     newsId === item.id
@@ -468,8 +486,8 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
           <div className="panel border-amber-500/40 p-3 text-[12px] leading-relaxed text-amber-300">
             🧩 AI 未启用或调用失败，本次已自动回退到本地模板引擎。原因：{result.aiError}
             <br />
-            在 .env 填入 <code className="text-amber-200">OPENAI_API_KEY</code>（可选
-            <code className="text-amber-200"> OPENAI_MODEL / OPENAI_BASE_URL</code>）后重启服务即可启用 AI。
+            可前往 <Link href="/setup-key" className="text-orange-300 underline underline-offset-2 hover:text-orange-200">🔑 密钥设置</Link> 填入你的
+            DashScope Key 立即启用（Key 只保存在你自己的浏览器中）。
           </div>
         ) : null}
 
@@ -487,19 +505,28 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
               </span>
             </div>
           </div>
-          <input
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder="标题（生成后可编辑）"
-            className="field font-semibold"
-          />
-          <textarea
-            value={body}
-            onChange={(e) => setBody(e.target.value)}
-            placeholder="点击左侧「生成文案」，正文会自动填入，可继续手动润色。"
-            rows={16}
-            className="field scroll-thin min-h-[320px] leading-relaxed"
-          />
+          <div className="relative space-y-3">
+            <input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="标题（生成后可编辑）"
+              className="field font-semibold"
+            />
+            <textarea
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              placeholder="点击左侧「生成文案」，正文会自动填入，可继续手动润色。"
+              rows={16}
+              className="field scroll-thin min-h-[320px] leading-relaxed"
+            />
+            {busy ? (
+              <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 rounded-lg bg-slate-950/70 backdrop-blur-sm">
+                <span className="h-9 w-9 animate-spin rounded-full border-[3px] border-orange-400 border-t-transparent" />
+                <p className="text-sm font-semibold text-slate-100">正在生成文案…</p>
+                <p className="text-[11px] text-slate-400">AI 正在整合所选数据源，完成后自动填入</p>
+              </div>
+            ) : null}
+          </div>
           <div className="flex flex-wrap gap-2">
             <button className="btn btn-ghost !py-1.5 !text-xs" onClick={() => copyText(`${title}\n\n${body}`, "全文")}>
               📋 复制全文

@@ -2,16 +2,16 @@ import type {
   GameLeader,
   GameSummary,
   GameTeam,
+  LeaderRow,
   NewsItem,
   PlayerGameLogEntry,
   PlayerProfile,
+  PlayerSeasonStat,
   StatSplit,
 } from "./types";
 
 const ESPN_SITE = "https://site.web.api.espn.com";
 const ESPN_CORE = "https://sports.core.api.espn.com";
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 type Json = Record<string, unknown>;
 
@@ -19,8 +19,10 @@ async function getJson<T>(url: string, timeoutMs = 9000): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    // 纯前端浏览器直连：不设置 User-Agent（非 CORS safelisted，会触发 preflight；
+    // 浏览器本就会带真实 UA），保持 simple request 以命中 ESPN 的 ACAO:*。
     const res = await fetch(url, {
-      headers: { "User-Agent": UA, Accept: "application/json" },
+      headers: { Accept: "application/json" },
       signal: controller.signal,
       cache: "no-store",
     });
@@ -111,6 +113,17 @@ function mapEvent(event: Json, fallbackDate: string): GameSummary {
     .slice(0, 3)
     .join(" / ");
   const series = (comp.series as Json | undefined) ?? null;
+  // 赛季阶段：ESPN event.season.type 1=季前赛 2=常规赛 3=季后赛
+  // 常规赛也存在"赛季交手战绩"字段，直接展示会被误读为季后赛系列赛，故仅季后赛保留 series
+  const seasonRaw = (event.season as Json | undefined) ?? {};
+  const seasonTypeNum = num(seasonRaw.type);
+  const seasonSlug = str(seasonRaw.slug) ?? "";
+  const seasonType: GameSummary["seasonType"] =
+    seasonTypeNum === 3 || seasonSlug.includes("post")
+      ? "post"
+      : seasonTypeNum === 1 || seasonSlug.includes("pre")
+        ? "pre"
+        : "regular";
   const links = (event.links as Json[] | undefined) ?? [];
 
   return {
@@ -126,7 +139,8 @@ function mapEvent(event: Json, fallbackDate: string): GameSummary {
     away,
     venue: str((comp.venue as Json | undefined)?.fullName),
     broadcast: broadcastNames || null,
-    series: series ? str(series.summary) : null,
+    series: seasonType === "post" && series ? str(series.summary) : null,
+    seasonType,
     odds: odds
       ? {
           detail: str(odds.details) ?? "",
@@ -273,6 +287,283 @@ export async function fetchAthleteOverview(espnId: string, season?: number): Pro
     note: str(rotowire.injuryNews) ?? str(rotowire.news) ?? null,
     seasonYear: year,
   };
+}
+
+/* ------------------------------ 联盟数据榜 ------------------------------ */
+
+/**
+ * ESPN 数据榜各类别对应的服务端排序键（均为场均口径）。
+ * eff（效率值）ESPN 未提供，本地用 PTS+REB+AST+STL+BLK-TOV 估算。
+ */
+const ESPN_LEADER_SORTS: Record<string, string> = {
+  pts: "offensive.avgPoints",
+  reb: "general.avgRebounds",
+  ast: "offensive.avgAssists",
+  stl: "defensive.avgSteals",
+  blk: "defensive.avgBlocks",
+  fg3m: "offensive.avgThreePointFieldGoalsMade",
+  fgp: "offensive.fieldGoalPct",
+  min: "general.avgMinutes",
+};
+
+type EspnLeaderEntry = {
+  athlete?: {
+    id?: string | number;
+    displayName?: string;
+    teamShortName?: string;
+    teams?: { abbreviation?: string }[];
+  };
+  categories?: { name?: string; values?: (number | null)[] }[];
+};
+
+/**
+ * ESPN 官方数据榜（byathlete 接口，CORS 开放，纯前端亦可直连）。
+ * 一次请求返回每名球员的完整数据行（出场/场均时间/得分/篮板/助攻/抢断/盖帽/失误/三项命中率），
+ * 本地按索引取值；命中率字段换算为 0-1 小数，与 nbaStats 的 LeaderRow 约定一致。
+ */
+export async function fetchEspnLeaders(options: {
+  seasonYear: number;
+  statCategory?: string;
+  /** 2 = 常规赛，3 = 季后赛 */
+  seasonType?: 2 | 3;
+  limit?: number;
+}): Promise<LeaderRow[]> {
+  const { seasonYear, statCategory = "pts", seasonType = 2, limit = 50 } = options;
+  const sortKey = ESPN_LEADER_SORTS[statCategory] ?? ESPN_LEADER_SORTS.pts;
+  // 注意 ESPN 赛季编号 = 赛季结束年份：season=2026 即 2025-26 赛季，
+  // 而应用内 seasonYear=2026 表示 2026-27，故请求时需 +1
+  const url =
+    `${ESPN_SITE}/apis/common/v3/sports/basketball/nba/statistics/byathlete` +
+    `?region=us&lang=en&contentorigin=espn&isqualified=true&page=1&limit=${limit}` +
+    `&season=${seasonYear + 1}&seasontype=${seasonType}` +
+    `&sort=${encodeURIComponent(`${sortKey}:desc`)}`;
+  const data = await getJson<{
+    categories?: { name?: string; names?: string[] }[];
+    athletes?: EspnLeaderEntry[];
+  }>(url, 12000);
+
+  // 顶层 categories 给出每个板块的字段顺序，运动员行的 values 与之平行
+  const index = new Map<string, number>();
+  for (const cat of data.categories ?? []) {
+    (cat.names ?? []).forEach((name, i) => index.set(`${cat.name}.${name}`, i));
+  }
+
+  const rows: LeaderRow[] = [];
+  for (const entry of data.athletes ?? []) {
+    const cats = entry.categories ?? [];
+    const value = (key: string): number | null => {
+      const i = index.get(key);
+      if (i === undefined) return null;
+      const catName = key.split(".")[0];
+      const v = cats.find((c) => c.name === catName)?.values?.[i];
+      return typeof v === "number" && Number.isFinite(v) ? v : null;
+    };
+    const pct = (key: string): number | null => {
+      const v = value(key);
+      return v === null ? null : v / 100;
+    };
+    const athlete = entry.athlete ?? {};
+    const id = athlete.id === undefined || athlete.id === null ? "" : String(athlete.id);
+    const name = athlete.displayName ?? "";
+    if (!id || !name) continue;
+    rows.push({
+      rank: 0,
+      espnId: id,
+      playerName: name,
+      teamAbbr: athlete.teamShortName ?? athlete.teams?.[0]?.abbreviation ?? null,
+      gp: value("general.gamesPlayed"),
+      min: value("general.avgMinutes"),
+      fgp: pct("offensive.fieldGoalPct"),
+      tpp: pct("offensive.threePointFieldGoalPct"),
+      ftp: pct("offensive.freeThrowPct"),
+      reb: value("general.avgRebounds"),
+      ast: value("offensive.avgAssists"),
+      stl: value("defensive.avgSteals"),
+      blk: value("defensive.avgBlocks"),
+      tov: value("offensive.avgTurnovers"),
+      pts: value("offensive.avgPoints"),
+    });
+  }
+
+  if (statCategory === "eff") {
+    const eff = (r: LeaderRow) =>
+      (r.pts ?? 0) + (r.reb ?? 0) + (r.ast ?? 0) + (r.stl ?? 0) + (r.blk ?? 0) - (r.tov ?? 0);
+    rows.sort((a, b) => eff(b) - eff(a));
+  }
+  rows.forEach((row, i) => {
+    row.rank = i + 1;
+  });
+  return rows;
+}
+
+/* ---------------------------- 球员生涯赛季数据 ---------------------------- */
+
+/**
+ * ESPN 球队 id → 标准缩写。id 随队史迁徙延续（如 17 含新泽西网时期、25 含超音速时期），
+ * 因此历史赛季的球队一律显示为现今对应球队的缩写。
+ */
+const ESPN_TEAM_ABBR: Record<string, string> = {
+  "1": "ATL", "2": "BOS", "3": "NOP", "4": "CHI", "5": "CLE",
+  "6": "DAL", "7": "DEN", "8": "DET", "9": "GSW", "10": "HOU",
+  "11": "IND", "12": "LAC", "13": "LAL", "14": "MIA", "15": "MIL",
+  "16": "MIN", "17": "BKN", "18": "NYK", "19": "ORL", "20": "PHI",
+  "21": "PHX", "22": "POR", "23": "SAC", "24": "SAS", "25": "OKC",
+  "26": "UTA", "27": "WAS", "28": "TOR", "29": "MEM", "30": "CHA",
+};
+
+type AthleteSeasonLogEntry = { year: number; hasPlayoffs: boolean; teamAbbr: string | null };
+
+/**
+ * 球员生涯赛季清单：哪些赛季有数据、该季是否打了季后赛、当季所属球队。
+ * statisticslog 每赛季一条；其 "total" 统计引用指向该季最高赛事级别
+ * （types/3 = 该季有季后赛，types/2 = 仅常规赛），球队引用 URL 末段即球队 id。
+ */
+export async function fetchAthleteSeasonLog(espnId: string): Promise<AthleteSeasonLogEntry[]> {
+  const url =
+    `${ESPN_CORE}/v2/sports/basketball/leagues/nba/athletes/${espnId}/statisticslog` +
+    `?lang=en&region=us&limit=100`;
+  const data = await getJson<{ entries?: Json[] }>(url);
+  const out: AthleteSeasonLogEntry[] = [];
+  for (const entry of data.entries ?? []) {
+    const seasonRef = str((entry.season as Json | undefined)?.$ref) ?? "";
+    const year = Number(seasonRef.match(/\/seasons\/(\d+)/)?.[1]);
+    if (!Number.isFinite(year)) continue;
+    const stats = (entry.statistics as Json[] | undefined) ?? [];
+    const total = stats.find((s) => s.type === "total") as Json | undefined;
+    const totalRef = str((total?.statistics as Json | undefined)?.$ref) ?? "";
+    const team = stats.find((s) => s.type === "team") as Json | undefined;
+    const teamRef = str((team?.team as Json | undefined)?.$ref) ?? "";
+    const teamId = teamRef.match(/\/teams\/(\d+)/)?.[1] ?? "";
+    out.push({
+      year,
+      hasPlayoffs: totalRef.includes("/types/3/"),
+      teamAbbr: ESPN_TEAM_ABBR[teamId] ?? null,
+    });
+  }
+  return out;
+}
+
+type SeasonAverages = Omit<
+  PlayerSeasonStat,
+  "seasonLabel" | "seasonYear" | "seasonType" | "teamAbbr" | "source"
+>;
+
+/** 球员单季场均数据（type 2=常规赛 / 3=季后赛）；该季未参赛时上游返回 404，归一化为 null */
+async function fetchAthleteSeasonAverages(
+  espnId: string,
+  year: number,
+  seasonType: 2 | 3,
+): Promise<SeasonAverages | null> {
+  const url =
+    `${ESPN_CORE}/v2/sports/basketball/leagues/nba/seasons/${year}` +
+    `/types/${seasonType}/athletes/${espnId}/statistics/0?lang=en&region=us`;
+  let data: { splits?: { categories?: { name?: string; stats?: { name?: string; value?: number }[] }[] } };
+  try {
+    data = await getJson(url);
+  } catch {
+    return null; // 404 = 该季该阶段未参赛
+  }
+  const map = new Map<string, number>();
+  for (const cat of data.splits?.categories ?? []) {
+    for (const s of cat.stats ?? []) {
+      if (s.name && typeof s.value === "number" && Number.isFinite(s.value) && !map.has(s.name)) {
+        map.set(s.name, s.value);
+      }
+    }
+  }
+  if (!map.has("gamesPlayed")) return null;
+  const num = (key: string): number | null => map.get(key) ?? null;
+  const pct = (key: string): number | null => {
+    const v = map.get(key);
+    return v === undefined ? null : v / 100; // 上游为百分制，统一为 0-1 小数
+  };
+  return {
+    gp: num("gamesPlayed"),
+    min: num("avgMinutes"),
+    pts: num("avgPoints"),
+    reb: num("avgRebounds"),
+    ast: num("avgAssists"),
+    stl: num("avgSteals"),
+    blk: num("avgBlocks"),
+    tov: num("avgTurnovers"),
+    fgp: pct("fieldGoalPct"),
+    tpp: pct("threePointPct"),
+    ftp: pct("freeThrowPct"),
+  };
+}
+
+async function mapLimitLocal<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += limit) {
+    const chunk = items.slice(i, i + limit);
+    const settled = await Promise.allSettled(chunk.map(fn));
+    for (const s of settled) {
+      if (s.status === "fulfilled") results.push(s.value);
+    }
+  }
+  return results;
+}
+
+/**
+ * 球员生涯分赛季数据（常规赛 + 季后赛），全程 ESPN core API：
+ * CORS 开放、按球员 id 精确查询，不受 stats.nba.com 的「达标球员」过滤影响
+ * （因此新秀季、伤病缩水季也不会缺）。Pages 纯前端版可直接使用。
+ */
+export async function fetchEspnPlayerSeasonHistory(
+  espnId: string,
+  fromYear: number,
+  toYear: number,
+): Promise<PlayerSeasonStat[]> {
+  const start = Math.max(1979, fromYear);
+  const end = Math.min(toYear, currentNbaSeasonYear());
+  // statisticslog 的年份同样是「赛季结束年份」，减 1 后才是应用内的赛季起始年
+  const log = (await fetchAthleteSeasonLog(espnId)).filter(
+    (entry) => entry.year - 1 >= start && entry.year - 1 <= end,
+  );
+
+  const rows = await mapLimitLocal(log, 6, async (entry): Promise<PlayerSeasonStat[]> => {
+    const seasonYear = entry.year - 1;
+    const tasks: Promise<PlayerSeasonStat | null>[] = [
+      fetchAthleteSeasonAverages(espnId, entry.year, 2).then((avg) =>
+        avg
+          ? {
+              ...avg,
+              seasonLabel: seasonLabel(seasonYear),
+              seasonYear,
+              seasonType: "regular",
+              teamAbbr: entry.teamAbbr,
+              source: "live" as const,
+            }
+          : null,
+      ),
+    ];
+    if (entry.hasPlayoffs) {
+      tasks.push(
+        fetchAthleteSeasonAverages(espnId, entry.year, 3).then((avg) =>
+          avg
+            ? {
+                ...avg,
+                seasonLabel: seasonLabel(seasonYear),
+                seasonYear,
+                seasonType: "playoffs",
+                teamAbbr: entry.teamAbbr,
+                source: "live" as const,
+              }
+            : null,
+        ),
+      );
+    }
+    const settled = await Promise.all(tasks);
+    return settled.filter((r): r is PlayerSeasonStat => r !== null);
+  });
+
+  return rows
+    .flat()
+    .sort((a, b) => b.seasonYear - a.seasonYear || (a.seasonType === "regular" ? -1 : 1));
 }
 
 /** ESPN 赛季标签：2026 年秋开始的赛季记作 2026-27 */

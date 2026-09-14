@@ -47,6 +47,13 @@ export default function SiteNav() {
             );
           })}
         </nav>
+        <Link
+          href="/setup-key"
+          title="DashScope API Key 设置"
+          className="btn btn-ghost shrink-0 !px-2.5 !py-1.5 !text-xs"
+        >
+          🔑 密钥
+        </Link>
         <ThemeToggle />
       </div>
     </header>

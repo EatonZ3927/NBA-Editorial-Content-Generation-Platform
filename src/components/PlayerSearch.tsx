@@ -2,14 +2,9 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { searchPlayers, type PlayerSearchHit } from "@/lib/nba/store";
 
-type Hit = {
-  espnId: string;
-  name: string;
-  zhName?: string | null;
-  team?: string | null;
-  headshot?: string | null;
-};
+type Hit = PlayerSearchHit;
 
 export default function PlayerSearch() {
   const [query, setQuery] = useState("");
@@ -22,10 +17,7 @@ export default function PlayerSearch() {
       setLoading(true);
       setError(null);
       try {
-        const res = await fetch(`/api/players?q=${encodeURIComponent(query.trim())}`);
-        const data = (await res.json()) as { results?: Hit[]; error?: string };
-        setHits(data.results ?? []);
-        if (data.error) setError(data.error);
+        setHits(await searchPlayers(query.trim()));
       } catch {
         setError("搜索请求失败，请稍后重试");
         setHits([]);
@@ -62,7 +54,7 @@ export default function PlayerSearch() {
         {hits.map((hit) => (
           <Link
             key={hit.espnId}
-            href={`/players/${hit.espnId}`}
+            href={`/player?id=${hit.espnId}`}
             className="panel group flex items-center gap-3 p-3 transition hover:-translate-y-0.5 hover:border-orange-500/50"
           >
             {/* eslint-disable-next-line @next/next/no-img-element */}

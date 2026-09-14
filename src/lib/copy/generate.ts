@@ -1,4 +1,4 @@
-import { getLeagueLeaders, getNews, getPlayerProfile, getScoreboard } from "@/lib/nba/service";
+import { getLeagueLeaders, getNews, getPlayerProfile, getScoreboard } from "@/lib/nba/store";
 import { currentNbaSeasonYear } from "@/lib/nba/espn";
 import { generateCopy, type CopyContext, type CopyResult, type LengthId, type TemplateId, type ToneId } from "./engine";
 import { generateCopyWithAi, isAiConfigured, type AiInput } from "./ai";
@@ -16,6 +16,8 @@ export type GenerateInput = {
   seasonYear?: number | null;
   /** false 时强制走本地模板引擎（用于对比/兜底） */
   useAi?: boolean;
+  /** 用户自有 DashScope Key（BYOK），优先于服务端环境变量 */
+  userApiKey?: string | null;
 };
 
 export type GenerateOutput = CopyResult & { context: CopyContext };
@@ -64,7 +66,7 @@ export async function buildContext(input: GenerateInput): Promise<CopyContext> {
       getLeagueLeaders(year, "pts")
         .then((leaders) => {
           ctx.leaders = leaders.rows;
-          ctx.seasonYear = year;
+          ctx.seasonYear = leaders.season ?? year; // 用实际返回数据的赛季，避免休赛期标注成未开打赛季
         })
         .catch(() => undefined),
     );
@@ -84,12 +86,13 @@ export async function runGenerate(input: GenerateInput): Promise<GenerateOutput>
     ctx,
     keywords: input.keywords,
     variant: input.variant,
+    userApiKey: input.userApiKey,
   };
 
   const wantAi = input.useAi !== false;
 
-  // AI 优先：已配置密钥时调用大模型生成
-  if (wantAi && isAiConfigured()) {
+  // AI 优先：用户自带 Key 或服务端已配置密钥时调用大模型生成
+  if (wantAi && isAiConfigured(input.userApiKey)) {
     try {
       const ai = await generateCopyWithAi(gen);
       return { ...ai, context: ctx };
