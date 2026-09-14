@@ -32,11 +32,15 @@ npm run dev        # http://localhost:3000
 
 ## 部署到 GitHub Pages
 
-仓库已内置 `.github/workflows/pages.yml`：推送 `main` 分支即自动构建静态站点（`next build` → `out/`）并发布。
+一条命令完成构建 + 发布（会把静态站点强制推送到 `gh-pages` 分支）：
 
-首次使用需在仓库 **Settings → Pages → Source** 选择 **「GitHub Actions」**。
+```bash
+bash scripts/deploy-pages.sh
+```
 
-构建时通过环境变量 `PAGES_BASE_PATH=/NBA-Editorial-Content-Generation-Platform` 注入子路径前缀（项目页路径）；本地开发无需设置。
+首次使用需在仓库 **Settings → Pages → Source** 选择 **「Deploy from a branch」**，Branch 选 **`gh-pages` / (root)**。
+
+构建时通过环境变量 `PAGES_BASE_PATH=/<仓库名>` 注入子路径前缀（项目页路径）；本地开发无需设置。之后每次改动代码，重新运行上面的脚本即可更新线上页面。
 
 ## 给编辑同事使用
 
