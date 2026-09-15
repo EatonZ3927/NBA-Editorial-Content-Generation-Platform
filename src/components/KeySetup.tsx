@@ -14,11 +14,6 @@ export function getUserApiKey(): string {
   }
 }
 
-function maskKey(key: string): string {
-  if (key.length <= 8) return "sk-••••";
-  return `${key.slice(0, 6)}••••${key.slice(-4)}`;
-}
-
 /**
  * DashScope API Key 设置页（纯前端 BYOK）：
  * key 只保存在用户自己的浏览器 localStorage 中；
@@ -93,12 +88,12 @@ export default function KeySetup() {
         </div>
 
         {saved ? (
-          <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-[13px] text-emerald-200">
-            ✅ 已保存 Key：<span className="font-mono">{maskKey(saved)}</span>
+          <div className="flex items-center justify-between rounded-xl border border-emerald-300 bg-emerald-100 px-4 py-3 text-[13px] font-medium text-emerald-950">
+            <span>✅ 已保存 Key</span>
             <button
               type="button"
               onClick={clear}
-              className="ml-2 text-[12px] text-slate-400 underline underline-offset-2 hover:text-slate-200"
+              className="text-[12px] text-emerald-700 underline underline-offset-2 hover:text-emerald-900"
             >
               清除
             </button>
