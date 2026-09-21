@@ -174,6 +174,19 @@ function newsContentKey(item: Pick<NewsItem, "headline" | "description">): strin
   return `${normalizeNewsText(item.headline)}|${normalizeNewsText(item.description)}`;
 }
 
+/**
+ * 同一 ESPN 稿件的更新版本会共用同一个 id（按需求：内容有更新的版本要同时保留）。
+ * 给第 2、3… 个重复 id 追加 ~2、~3 后缀，保证列表渲染 key 与选中逻辑唯一。
+ */
+function ensureUniqueNewsIds(items: NewsItem[]): NewsItem[] {
+  const seen = new Map<string, number>();
+  return items.map((item) => {
+    const n = (seen.get(item.id) ?? 0) + 1;
+    seen.set(item.id, n);
+    return n === 1 ? item : { ...item, id: `${item.id}~${n}` };
+  });
+}
+
 function sortNews(items: NewsItem[]): NewsItem[] {
   return [...items].sort((a, b) => (b.publishedAt ?? "").localeCompare(a.publishedAt ?? ""));
 }
@@ -240,7 +253,7 @@ export async function getNews(limit = 30): Promise<NewsResult> {
     live = readStoredNews();
   }
 
-  const items = sortNews(live).slice(0, limit);
+  const items = ensureUniqueNewsIds(sortNews(live)).slice(0, limit);
   const source: DataSource = fetched && items.length > 0 ? "live" : items.length > 0 ? "cache" : "offline";
   return { source, items, fetchedAt: nowIso(), nextAutoRefreshAt: nextAutoRefreshAt() };
 }
@@ -252,7 +265,7 @@ export async function getNews(limit = 30): Promise<NewsResult> {
 export async function refreshNewsForUser(limit = 40): Promise<NewsResult> {
   const live = await fetchLiveNews(limit);
   const stored = readStoredNews();
-  const items = mergeNews(live.items, stored).slice(0, limit);
+  const items = ensureUniqueNewsIds(mergeNews(live.items, stored)).slice(0, limit);
   const source: DataSource = live.ok && live.items.length > 0 ? "live" : items.length > 0 ? "cache" : "offline";
   return { source, items, fetchedAt: nowIso(), nextAutoRefreshAt: nextAutoRefreshAt(), manual: true };
 }

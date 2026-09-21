@@ -317,3 +317,241 @@ export async function generateCopyWithAi(input: AiInput): Promise<CopyResult> {
     generatedBy: "ai",
   };
 }
+
+/* ---------------- 新闻原文完整翻译（供新闻转写的左右对照） ---------------- */
+
+export type NewsTranslation = {
+  titleZh: string;
+  bodyZh: string;
+  /** full=拿到原文全文并完整翻译；summary=原文只提供摘要，已完整翻译摘要 */
+  scope: "full" | "summary";
+  /** 逐段中英对照（英文为已翻译覆盖的部分）；无正文时为空数组。en 为空串的条目表示纯中文附注 */
+  pairs: { en: string; zh: string }[];
+};
+
+function extractJsonObject(raw: string): Record<string, unknown> {
+  let text = raw.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) text = text.slice(start, end + 1);
+  return JSON.parse(text) as Record<string, unknown>;
+}
+
+/** 全文翻译的总字符上限：最多抓取原文前 10000 个字符（按段落边界截断） */
+const TRANSLATE_BODY_LIMIT = 10000;
+/** 单个翻译请求的字符上限：长文按段落边界切分为多块翻译后再按序拼接，保证全文完整不缩略 */
+const TRANSLATE_CHUNK_SIZE = 3600;
+/** 极端长文的最多分块数（超出部分省略并附注），防止超长稿件产生过多请求 */
+const TRANSLATE_MAX_CHUNKS = 16;
+/** 分块翻译的并行度上限：避免触发模型限流 */
+const TRANSLATE_CONCURRENCY = 4;
+
+/** 按总上限截断，优先落在段落边界，避免截断在半句话中间 */
+function truncateAtParagraph(text: string, limit: number): { text: string; truncated: boolean } {
+  if (text.length <= limit) return { text, truncated: false };
+  const head = text.slice(0, limit);
+  const lastPara = head.lastIndexOf("\n\n");
+  return { text: (lastPara > limit * 0.5 ? head.slice(0, lastPara) : head).trim(), truncated: true };
+}
+
+/** 按空行拆分段落 */
+function splitParas(text: string): string[] {
+  return text
+    .split(/\n{2,}/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * 把一段英文与其译文按段落一一配对（依赖 prompt 的逐段对应约束）。
+ * 段落数不一致时降级为「整块英文 + 整块中文」的单对，保证对照可用。
+ */
+function pairParagraphs(enText: string, zhText: string): { en: string; zh: string }[] {
+  const enParas = splitParas(enText);
+  const zhParas = splitParas(zhText);
+  if (enParas.length === 0) return [];
+  if (enParas.length === zhParas.length) {
+    return enParas.map((en, i) => ({ en, zh: zhParas[i] }));
+  }
+  return [{ en: enText.trim(), zh: zhText.trim() }];
+}
+
+function splitIntoChunks(text: string, size: number): string[] {
+  const paras = text.split("\n\n").filter((s) => s.trim().length > 0);
+  const chunks: string[] = [];
+  let cur = "";
+  for (const para of paras) {
+    if (cur && cur.length + para.length + 2 > size) {
+      chunks.push(cur);
+      cur = para;
+    } else {
+      cur = cur ? cur + "\n\n" + para : para;
+    }
+  }
+  if (cur) chunks.push(cur);
+  // 单段超长（无段落边界）时硬切
+  const out: string[] = [];
+  for (const c of chunks) {
+    if (c.length <= size) {
+      out.push(c);
+    } else {
+      for (let i = 0; i < c.length; i += size) out.push(c.slice(i, i + size));
+    }
+  }
+  return out;
+}
+
+/** 简易并发池：按 limit 并行执行，保持结果顺序 */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const idx = i++;
+      results[idx] = await fn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+type ChatMessage = { role: "system" | "user"; content: string };
+
+/** 翻译专用的最小 chat 调用（支持纯文本或 JSON 输出），与文案生成链路互不影响 */
+async function callChat(
+  cfg: { apiKey: string; baseUrl: string; model: string; jsonMode: boolean },
+  messages: ChatMessage[],
+  opts: { json: boolean; temperature: number; timeoutMs: number },
+): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+  const requestBody: Record<string, unknown> = { model: cfg.model, temperature: opts.temperature, messages };
+  if (opts.json && cfg.jsonMode) requestBody.response_format = { type: "json_object" };
+
+  let res: Response;
+  try {
+    res = await fetch(`${cfg.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cfg.apiKey}`,
+      },
+      body: JSON.stringify(requestBody),
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    const err = e as Error;
+    throw new Error(`翻译请求失败：${err.name === "AbortError" ? "请求超时" : err.message}`);
+  }
+  clearTimeout(timer);
+
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => "");
+    throw new Error(`翻译接口返回 ${res.status}：${bodyText.slice(0, 200)}`);
+  }
+
+  const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error("翻译返回内容为空");
+  return content;
+}
+
+const TRANSLATE_JSON_SYS = [
+  "你是资深的 NBA 中文编辑，负责把英文新闻完整翻译成中文体育媒体稿件。",
+  "要求：忠实完整、逐段翻译，不增删任何事实、数字、引语与细节；行文流畅自然，符合中文体育新闻的表达习惯。",
+  "段落结构必须与原文严格一一对应：原文分几段，译文就分几段，顺序一致，不合并、不拆分（用于逐段中英对照展示）",
+  "球员与教练姓名使用中文通用译名，并在首次出现时括注英文原名，如 斯蒂芬·库里（Stephen Curry）；球队使用中文队名。",
+  "若原文只有标题没有正文，则只翻译标题，bodyZh 用一句话说明原文仅发布了标题。",
+  '严格输出 JSON：{"titleZh":"中文标题","bodyZh":"中文正文（多段落用 \\n\\n 分隔）"}。',
+].join("\n");
+
+const TRANSLATE_CHUNK_SYS = [
+  "你是资深的 NBA 中文编辑，负责把英文新闻完整翻译成中文。",
+  "输入是整篇新闻按顺序切分后的其中一段。请把该段忠实完整地逐句翻译成中文，保持原有段落结构（段落间用空行分隔），不得省略、概括或增删任何信息。该段的段落数量必须与输入严格一致（用于逐段中英对照展示）。",
+  "球员与教练姓名使用中文通用译名，并在首次出现时括注英文原名；球队使用中文队名。",
+  "直接输出该段的中文译文纯文本：不要输出标题、不要解释、不要任何标记或包裹符号。",
+].join("\n");
+
+const TRANSLATE_TITLE_SYS =
+  "把用户给出的英文新闻标题翻译成中文体育新闻标题，直接输出译文纯文本，不要解释、不要引号。";
+
+/**
+ * 把英文新闻完整翻译成中文（标题 + 正文/全文）。
+ * 短文单次调用；长文按段落分块后并行翻译再按序拼接，保证全文完整、不缩略。
+ * 失败时由调用方兜底展示英文原文。
+ */
+export async function translateNewsWithAi(
+  news: { headline: string; body: string | null; isFullText: boolean },
+  userApiKey?: string | null,
+): Promise<NewsTranslation> {
+  const cfg = aiConfig(userApiKey);
+  if (!cfg.apiKey) throw new Error("未配置 API Key（可在密钥设置页填入 DashScope Key）");
+
+  const scope: "full" | "summary" = news.isFullText ? "full" : "summary";
+  const rawBody = (news.body ?? "").trim();
+  // 最多抓取前 10000 个字符（段落边界截断），再按 3600 字符/块切分翻译
+  const { text: bodyText, truncated } = truncateAtParagraph(rawBody, TRANSLATE_BODY_LIMIT);
+  const chunks = bodyText ? splitIntoChunks(bodyText, TRANSLATE_CHUNK_SIZE) : [];
+  const capped = chunks.slice(0, TRANSLATE_MAX_CHUNKS);
+  const wasCapped = truncated || chunks.length > TRANSLATE_MAX_CHUNKS;
+
+  // 无正文或单块短文：单次 JSON 调用（标题+正文一起翻）
+  if (capped.length <= 1) {
+    const user = [
+      `【英文标题】${news.headline}`,
+      bodyText
+        ? `【英文${news.isFullText ? "全文" : "摘要"}】${capped[0] ?? ""}`
+        : "【英文正文】（原文仅提供标题，无正文内容）",
+    ].join("\n");
+    const content = await callChat(
+      cfg,
+      [
+        { role: "system", content: TRANSLATE_JSON_SYS },
+        { role: "user", content: user },
+      ],
+      { json: true, temperature: 0.3, timeoutMs: 90000 },
+    );
+    const obj = extractJsonObject(content);
+    const titleZh = typeof obj.titleZh === "string" ? obj.titleZh.trim() : "";
+    const bodyZh = typeof obj.bodyZh === "string" ? obj.bodyZh.trim() : "";
+    if (!titleZh && !bodyZh) throw new Error("翻译结果缺少内容");
+    const pairs = bodyText ? pairParagraphs(bodyText, bodyZh) : [];
+    return { titleZh: titleZh || news.headline, bodyZh: bodyZh || titleZh, scope, pairs };
+  }
+
+  // 长文：标题一次小调用 + 各分块限流并行翻译（纯文本输出），按序拼接
+  const [titleZh, parts] = await Promise.all([
+    callChat(
+      cfg,
+      [
+        { role: "system", content: TRANSLATE_TITLE_SYS },
+        { role: "user", content: news.headline },
+      ],
+      { json: false, temperature: 0.2, timeoutMs: 45000 },
+    ),
+    mapLimit(capped, TRANSLATE_CONCURRENCY, async (chunk, i) => {
+      const zh = await callChat(
+        cfg,
+        [
+          { role: "system", content: TRANSLATE_CHUNK_SYS },
+          { role: "user", content: `【第 ${i + 1} / ${capped.length} 段】\n${chunk}` },
+        ],
+        { json: false, temperature: 0.3, timeoutMs: 90000 },
+      );
+      // 每块内部按段落配对（块的英文段落是已知的），保证对照逐段对齐
+      return { zh, pairs: pairParagraphs(chunk, zh) };
+    }),
+  ]);
+
+  let bodyZh = parts.map((t) => t.zh.trim()).filter(Boolean).join("\n\n");
+  if (!bodyZh) throw new Error("翻译结果缺少内容");
+  const pairs = parts.flatMap((t) => t.pairs);
+  if (wasCapped) {
+    const note = "（注：原文较长，已完整翻译前 1 万字符的内容；剩余部分可点击下方「查看英文原文」阅读。）";
+    bodyZh += `\n\n${note}`;
+    pairs.push({ en: "", zh: note }); // en 为空串：对照模式只渲染中文附注
+  }
+  return { titleZh: titleZh.trim() || news.headline, bodyZh, scope, pairs };
+}

@@ -12,6 +12,7 @@ import type {
 
 const ESPN_SITE = "https://site.web.api.espn.com";
 const ESPN_CORE = "https://sports.core.api.espn.com";
+const ESPN_CONTENT = "https://content.core.api.espn.com";
 
 type Json = Record<string, unknown>;
 
@@ -171,6 +172,41 @@ export async function fetchNews(limit = 30): Promise<NewsItem[]> {
       .filter((c): c is string => Boolean(c))
       .slice(0, 4),
   }));
+}
+
+/** 把 ESPN 文章 HTML 转成纯文本段落（去标签、去掉视频/图片占位，保留段落分隔） */
+function storyHtmlToText(html: string): string {
+  if (typeof DOMParser !== "undefined") {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    doc.querySelectorAll("script,style,iframe,figure,aside,video1,photo1").forEach((el) => el.remove());
+    const paras = Array.from(doc.querySelectorAll("p"))
+      .map((el) => (el.textContent ?? "").replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    if (paras.length > 0) return paras.join("\n\n");
+    return (doc.body.textContent ?? "").replace(/\s+/g, " ").trim();
+  }
+  return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * 抓取新闻完整全文（ESPN content API；GET 为 simple request，返回 ACAO:*，浏览器可直连）。
+ * 兼容 nowId（如 1-49590770）与纯数字 id。失败返回 null，调用方回退到新闻摘要。
+ */
+export async function fetchNewsStory(articleId: string): Promise<string | null> {
+  const numericId = articleId.split("~")[0].split("-").pop() ?? articleId;
+  if (!/^\d+$/.test(numericId)) return null;
+  try {
+    const data = await getJson<{ headlines?: Json[] }>(
+      `${ESPN_CONTENT}/v1/sports/news/${numericId}`,
+      12000,
+    );
+    const story = str((data.headlines?.[0] as Json | undefined)?.story);
+    if (!story) return null;
+    const text = storyHtmlToText(story);
+    return text.length >= 40 ? text : null;
+  } catch {
+    return null;
+  }
 }
 
 /* ------------------------------ 球员 ------------------------------ */

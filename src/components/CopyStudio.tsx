@@ -12,12 +12,14 @@ import {
   type ToneId,
 } from "@/lib/copy/engine";
 import { runGenerate } from "@/lib/copy/generate";
+import { translateNewsWithAi, type NewsTranslation } from "@/lib/copy/ai";
 import {
   getNews,
   getScoreboard,
   saveDraft as persistDraft,
   searchPlayers,
 } from "@/lib/nba/store";
+import { fetchNewsStory } from "@/lib/nba/espn";
 import CalendarPicker from "@/components/CalendarPicker";
 import { teamZh } from "@/lib/nba/teams";
 
@@ -31,7 +33,16 @@ type GameSummary = {
   away: { abbr: string; displayName: string; score: number | null; record: string | null };
 };
 
-type NewsItem = { id: string; headline: string; publishedAt: string | null };
+type NewsItem = {
+  id: string;
+  headline: string;
+  description: string | null;
+  url: string | null;
+  publishedAt: string | null;
+};
+
+/** 双框对照缓存：translation 为 null 表示翻译失败（左框兜底展示英文原文 rawText） */
+type DualCacheEntry = { translation: NewsTranslation | null; rawText: string | null };
 type PlayerHit = { espnId: string; name: string; zhName?: string | null; team?: string | null };
 
 type CopyResult = {
@@ -92,6 +103,14 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+
+  // 新闻对照双框：左框展示原文的完整中文翻译，右框为可编辑的生成文案
+  const [translation, setTranslation] = useState<NewsTranslation | null>(null);
+  const [dualNews, setDualNews] = useState<NewsItem | null>(null);
+  const [dualRawText, setDualRawText] = useState<string | null>(null);
+  // 翻译框视图：dual=中英逐段对照；zh=只看译文
+  const [transView, setTransView] = useState<"dual" | "zh">("dual");
+  const translationCacheRef = useRef<Record<string, DualCacheEntry>>({});
 
   const flash = useCallback((msg: string) => {
     setToast(msg);
@@ -182,20 +201,69 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
       const v = nextVariant ?? variant;
       setBusy(true);
       setError(null);
+
+      // 只要选中了新闻素材（任意文体/语气/篇幅，可与其他数据源组合）：
+      // 右侧生成文案的同时，左侧并行生成原文的完整中文翻译（优先抓 ESPN 全文）
+      const newsTarget =
+        sources.news && newsId ? (newsItems.find((n) => n.id === newsId) ?? null) : null;
+      setDualNews(newsTarget);
+      if (!newsTarget) {
+        setTranslation(null);
+        setDualRawText(null);
+      }
+
+      let translationTask: Promise<DualCacheEntry | null> | null = null;
+      if (newsTarget) {
+        const cached = translationCacheRef.current[newsTarget.id];
+        if (cached) {
+          // 同一条新闻只翻译一次，「换一版」直接复用
+          setTranslation(cached.translation);
+          setDualRawText(cached.rawText);
+        } else {
+          const target = newsTarget;
+          translationTask = (async (): Promise<DualCacheEntry> => {
+            // 先抓 ESPN 全文正文（content API，CORS 开放），失败回退到新闻摘要
+            const story = await fetchNewsStory(target.id).catch(() => null);
+            const rawText = story ?? target.description ?? null;
+            try {
+              const t = await translateNewsWithAi(
+                { headline: target.headline, body: rawText, isFullText: Boolean(story) },
+                getUserApiKey() || null,
+              );
+              const entry: DualCacheEntry = { translation: t, rawText };
+              translationCacheRef.current[target.id] = entry;
+              return entry;
+            } catch {
+              // 翻译失败不阻断文案生成：缓存原文，左框兜底展示英文原文
+              const entry: DualCacheEntry = { translation: null, rawText };
+              translationCacheRef.current[target.id] = entry;
+              return entry;
+            }
+          })();
+        }
+      }
+
       try {
         // 纯前端架构：直接在本浏览器内组装数据并请求 DashScope（BYOK）
-        const data = await runGenerate({
-          template,
-          tone,
-          length,
-          keywords,
-          variant: v,
-          espnId: sources.player && espnId ? espnId : null,
-          gameId: sources.game && gameId ? gameId : null,
-          gameDate,
-          newsId: sources.news && newsId ? newsId : null,
-          userApiKey: getUserApiKey() || null,
-        });
+        const [data, trans] = await Promise.all([
+          runGenerate({
+            template,
+            tone,
+            length,
+            keywords,
+            variant: v,
+            espnId: sources.player && espnId ? espnId : null,
+            gameId: sources.game && gameId ? gameId : null,
+            gameDate,
+            newsId: sources.news && newsId ? newsId : null,
+            userApiKey: getUserApiKey() || null,
+          }),
+          translationTask ?? Promise.resolve(null),
+        ]);
+        if (trans) {
+          setTranslation(trans.translation);
+          setDualRawText(trans.rawText);
+        }
         setResult(data);
         setTitle(data.title);
         setBody(data.body);
@@ -207,7 +275,7 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
         setBusy(false);
       }
     },
-    [template, tone, length, keywords, variant, espnId, gameId, gameDate, newsId, sources, flash],
+    [template, tone, length, keywords, variant, espnId, gameId, gameDate, newsId, newsItems, sources, flash],
   );
 
   const saveDraft = useCallback(async () => {
@@ -246,42 +314,105 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
 
   const wordCount = body.replace(/\s/g, "").length;
 
+  // 生成中的遮罩层：单栏时覆盖编辑框，双栏时覆盖左右两个框
+  const busyOverlay = (
+    <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 rounded-xl bg-slate-950/70 backdrop-blur-sm">
+      <span className="h-9 w-9 animate-spin rounded-full border-[3px] border-orange-400 border-t-transparent" />
+      <p className="text-sm font-semibold text-slate-100">正在生成文案…</p>
+      <p className="text-[11px] text-slate-400">AI 正在整合所选数据源，完成后自动填入</p>
+    </div>
+  );
+
+  // 「编辑与发布」面板：dual=true 时作为双栏右框（与左框等高拉伸，遮罩移到外层）
+  const renderEditorPanel = (dual: boolean) => (
+    <div className={`panel p-4 ${dual ? "flex h-[560px] flex-col lg:h-[600px]" : "space-y-3"}`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-bold text-white">{dual && template === "news-brief" ? "3 · 转写文案（可编辑）" : "3 · 编辑与发布"}</h2>
+        <div className="flex items-center gap-2">
+          {result?.generatedBy ? (
+            <span className={`chip ${result.generatedBy === "ai" ? "!text-orange-300" : "!text-sky-300"}`}>
+              {result.generatedBy === "ai" ? "🤖 AI 生成" : "🧩 模板生成"}
+            </span>
+          ) : null}
+          <span className="text-[11px] text-slate-500">
+            {result ? `模板 ${result.templateName} · ` : ""}正文 {wordCount} 字
+          </span>
+        </div>
+      </div>
+      <div className={`relative ${dual ? "mt-3 flex min-h-0 flex-1 flex-col gap-3" : "space-y-3"}`}>
+        <input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="标题（生成后可编辑）"
+          className="field font-semibold"
+        />
+        <textarea
+          value={body}
+          onChange={(e) => setBody(e.target.value)}
+          placeholder="点击上方「生成文案」，正文会自动填入，可继续手动润色。"
+          rows={dual ? undefined : 16}
+          className={`field scroll-thin leading-relaxed ${dual ? "min-h-0 flex-1" : "min-h-[320px]"}`}
+        />
+        {!dual && busy ? busyOverlay : null}
+      </div>
+      <div className={`flex flex-wrap gap-2 ${dual ? "mt-3" : ""}`}>
+        <button className="btn btn-ghost !py-1.5 !text-xs" onClick={() => copyText(`${title}\n\n${body}`, "全文")}>
+          📋 复制全文
+        </button>
+        <button className="btn btn-ghost !py-1.5 !text-xs" onClick={() => copyText(title, "标题")}>
+          🏷️ 仅复制标题
+        </button>
+        <button className="btn btn-primary !py-1.5 !text-xs" onClick={saveDraft}>
+          💾 保存草稿
+        </button>
+        <Link href="/drafts" className="btn btn-ghost !py-1.5 !text-xs">
+          🗂️ 打开草稿箱
+        </Link>
+      </div>
+      {tags.length > 0 ? (
+        <div
+          className={`scroll-thin flex flex-wrap gap-1.5 border-t border-white/5 pt-3 ${dual ? "mt-3 max-h-20 shrink-0 overflow-y-auto" : ""}`}
+        >
+          {tags.map((tag) => (
+            <span key={tag} className="chip">
+              #{tag}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+
   return (
-    <div className="grid gap-6 lg:grid-cols-[minmax(0,420px)_minmax(0,1fr)]">
-      {/* 左：数据源 */}
+    <div className="space-y-6">
+      {/* 顶部：选项区（横向排布于页面上方） */}
       <section className="space-y-4">
+        {/* 1 · 选择数据源 */}
         <div className="panel p-4">
-          <h2 className="text-sm font-bold text-white">1 · 选择数据源</h2>
-          <p className="mt-1 text-[11px] text-slate-500">
-            可自由组合，也可以都不勾选（仅按文体与关键词生成）。
-          </p>
-          <div className="mt-3 flex gap-1.5">
-            {(
-              [
-                ["game", "🏀 比赛比分"],
-                ["player", "🔎 球员数据"],
-                ["news", "📰 新闻素材"],
-              ] as const
-            ).map(([key, label]) => (
+          <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+            <h2 className="text-sm font-bold text-white">1 · 选择数据源</h2>
+            <p className="text-[11px] text-slate-500">三个素材框并列展示，点框顶按钮勾选/取消；可自由组合，也可都不勾选（仅按文体与关键词生成）</p>
+          </div>
+          <div className="mt-3 grid items-stretch gap-3 md:grid-cols-3">
+            {/* 比赛比分 */}
+            <div
+              className={`flex h-[380px] flex-col rounded-xl border p-3 transition ${
+                sources.game ? "border-orange-500/60 bg-orange-500/5" : "border-white/10 bg-slate-900/50"
+              }`}
+            >
               <button
-                key={key}
-                onClick={() => toggleSource(key)}
-                aria-pressed={sources[key]}
-                className={`flex-1 rounded-lg border px-2 py-1.5 text-xs font-semibold transition ${
-                  sources[key]
+                type="button"
+                onClick={() => toggleSource("game")}
+                aria-pressed={sources.game}
+                className={`w-full shrink-0 rounded-lg border px-2 py-1.5 text-xs font-semibold transition ${
+                  sources.game
                     ? "border-orange-500/60 bg-orange-500/15 text-orange-200"
                     : "border-white/10 bg-slate-900/50 text-slate-500 hover:border-white/25 hover:text-slate-200"
                 }`}
               >
-                {sources[key] ? "✓ " : ""}
-                {label}
+                {sources.game ? "✓ " : ""}🏀 比赛比分
               </button>
-            ))}
-          </div>
-
-          {sources.game ? (
-            <div className="mt-3 space-y-2">
-              <div className="flex items-center gap-2">
+              <div className="mt-2 flex h-9 shrink-0 items-center gap-2">
                 <CalendarPicker
                   date={gameDate}
                   onSelect={(d) => {
@@ -292,12 +423,19 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
                 />
                 <span className="text-[11px] text-slate-500">比赛日期</span>
               </div>
-              <div className="scroll-thin max-h-72 space-y-1.5 overflow-y-auto pr-1">
+              <div
+                className={`scroll-thin mt-2 min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1 transition ${
+                  sources.game ? "" : "opacity-45"
+                }`}
+              >
                 {games.map((game) => (
                   <button
                     key={game.id}
                     id={`game-option-${game.id}`}
-                    onClick={() => setGameId(game.id)}
+                    onClick={() => {
+                      setGameId(game.id);
+                      if (!sources.game) setSources((s) => ({ ...s, game: true }));
+                    }}
                     className={`w-full rounded-lg border px-2.5 py-2 text-left text-[12px] transition ${
                       gameId === game.id
                         ? "border-orange-500/60 bg-orange-500/10 text-orange-100"
@@ -317,23 +455,45 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
                 ) : null}
               </div>
             </div>
-          ) : null}
 
-          {sources.player ? (
-            <div className="mt-3 space-y-2">
-              <input
-                value={playerQuery}
-                onChange={(e) => setPlayerQuery(e.target.value)}
-                placeholder="搜索球员：Curry / Doncic / 文班亚马"
-                className="field !py-1.5 !text-xs"
-              />
-              <div className="scroll-thin max-h-72 space-y-1.5 overflow-y-auto pr-1">
+            {/* 球员数据 */}
+            <div
+              className={`flex h-[380px] flex-col rounded-xl border p-3 transition ${
+                sources.player ? "border-orange-500/60 bg-orange-500/5" : "border-white/10 bg-slate-900/50"
+              }`}
+            >
+              <button
+                type="button"
+                onClick={() => toggleSource("player")}
+                aria-pressed={sources.player}
+                className={`w-full shrink-0 rounded-lg border px-2 py-1.5 text-xs font-semibold transition ${
+                  sources.player
+                    ? "border-orange-500/60 bg-orange-500/15 text-orange-200"
+                    : "border-white/10 bg-slate-900/50 text-slate-500 hover:border-white/25 hover:text-slate-200"
+                }`}
+              >
+                {sources.player ? "✓ " : ""}🔎 球员数据
+              </button>
+              <div className="mt-2 h-9 shrink-0">
+                <input
+                  value={playerQuery}
+                  onChange={(e) => setPlayerQuery(e.target.value)}
+                  placeholder="搜索球员：Curry / 文班亚马"
+                  className="field h-full !py-1.5 !text-xs"
+                />
+              </div>
+              <div
+                className={`scroll-thin mt-2 min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1 transition ${
+                  sources.player ? "" : "opacity-45"
+                }`}
+              >
                 {playerHits.map((hit) => (
                   <button
                     key={hit.espnId}
                     onClick={() => {
                       setEspnId(hit.espnId);
                       setPlayerName(hit.zhName ? `${hit.zhName} ${hit.name}` : hit.name);
+                      if (!sources.player) setSources((s) => ({ ...s, player: true }));
                     }}
                     className={`w-full rounded-lg border px-2.5 py-2 text-left text-[12px] transition ${
                       espnId === hit.espnId
@@ -349,7 +509,7 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
                 ))}
               </div>
               {espnId ? (
-                <p className="text-[11px] text-slate-500">
+                <p className="mt-2 shrink-0 text-[11px] text-slate-500">
                   已选：{playerName || espnId} ·{" "}
                   <Link href={`/player?id=${espnId}`} className="text-orange-300 hover:text-orange-200">
                     查看完整历史数据 ↗
@@ -357,40 +517,68 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
                 </p>
               ) : null}
             </div>
-          ) : null}
 
-          {sources.news ? (
-            <div className="scroll-thin mt-3 max-h-80 space-y-1.5 overflow-y-auto pr-1">
-              {newsItems.map((item) => (
-                <button
-                  key={item.id}
-                  id={`news-option-${item.id}`}
-                  onClick={() => setNewsId(item.id)}
-                  className={`w-full rounded-lg border px-2.5 py-2 text-left text-[12px] transition ${
-                    newsId === item.id
-                      ? "border-orange-500/60 bg-orange-500/10 text-orange-100"
-                      : "border-white/10 bg-slate-900/50 text-slate-300 hover:border-white/25"
-                  }`}
-                >
-                  <span className="line-clamp-2 block font-semibold">{item.headline}</span>
-                  <span className="block text-[11px] text-slate-500">{item.publishedAt?.slice(0, 10)}</span>
-                </button>
-              ))}
-              {newsItems.length === 0 ? (
-                <p className="px-1 py-6 text-center text-[12px] text-slate-500">暂无新闻</p>
-              ) : null}
+            {/* 新闻素材 */}
+            <div
+              className={`flex h-[380px] flex-col rounded-xl border p-3 transition ${
+                sources.news ? "border-orange-500/60 bg-orange-500/5" : "border-white/10 bg-slate-900/50"
+              }`}
+            >
+              <button
+                type="button"
+                onClick={() => toggleSource("news")}
+                aria-pressed={sources.news}
+                className={`w-full shrink-0 rounded-lg border px-2 py-1.5 text-xs font-semibold transition ${
+                  sources.news
+                    ? "border-orange-500/60 bg-orange-500/15 text-orange-200"
+                    : "border-white/10 bg-slate-900/50 text-slate-500 hover:border-white/25 hover:text-slate-200"
+                }`}
+              >
+                {sources.news ? "✓ " : ""}📰 新闻素材
+              </button>
+              <div className="mt-2 flex h-9 shrink-0 items-center">
+                <p className="text-[11px] text-slate-500">与新闻中心同步 · 保留近 10 天</p>
+              </div>
+              <div
+                className={`scroll-thin mt-2 min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1 transition ${
+                  sources.news ? "" : "opacity-45"
+                }`}
+              >
+                {newsItems.map((item) => (
+                  <button
+                    key={item.id}
+                    id={`news-option-${item.id}`}
+                    onClick={() => {
+                      setNewsId(item.id);
+                      if (!sources.news) setSources((s) => ({ ...s, news: true }));
+                    }}
+                    className={`w-full rounded-lg border px-2.5 py-2 text-left text-[12px] transition ${
+                      newsId === item.id
+                        ? "border-orange-500/60 bg-orange-500/10 text-orange-100"
+                        : "border-white/10 bg-slate-900/50 text-slate-300 hover:border-white/25"
+                    }`}
+                  >
+                    <span className="line-clamp-2 block font-semibold">{item.headline}</span>
+                    <span className="block text-[11px] text-slate-500">{item.publishedAt?.slice(0, 10)}</span>
+                  </button>
+                ))}
+                {newsItems.length === 0 ? (
+                  <p className="px-1 py-6 text-center text-[12px] text-slate-500">暂无新闻</p>
+                ) : null}
+              </div>
             </div>
-          ) : null}
+          </div>
         </div>
 
+        {/* 2 · 文体与语气 + 生成 */}
         <div className="panel space-y-4 p-4">
           <h2 className="text-sm font-bold text-white">2 · 文体与语气</h2>
-          <div className="space-y-2">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
             {TEMPLATES.map((t) => (
               <button
                 key={t.id}
                 onClick={() => setTemplate(t.id)}
-                className={`w-full rounded-xl border px-3 py-2 text-left transition ${
+                className={`h-full w-full rounded-xl border px-3 py-2 text-left transition ${
                   template === t.id
                     ? "border-orange-500/60 bg-orange-500/10"
                     : "border-white/10 bg-slate-900/50 hover:border-white/25"
@@ -405,64 +593,53 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
             ))}
           </div>
 
-          <div>
-            <p className="mb-1.5 text-[11px] font-semibold text-slate-400">语气</p>
-            <div className="flex flex-wrap gap-1.5">
-              {TONES.map((t) => (
-                <button
-                  key={t.id}
-                  onClick={() => setTone(t.id)}
-                  className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold transition ${
-                    tone === t.id ? "bg-sky-400 text-slate-900" : "bg-slate-800/70 text-slate-400 hover:text-slate-100"
-                  }`}
-                >
-                  {t.name}
-                </button>
-              ))}
+          <div className="grid gap-4 md:grid-cols-3">
+            <div>
+              <p className="mb-1.5 text-[11px] font-semibold text-slate-400">语气</p>
+              <div className="flex flex-wrap gap-1.5">
+                {TONES.map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => setTone(t.id)}
+                    className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold transition ${
+                      tone === t.id ? "bg-sky-400 text-slate-900" : "bg-slate-800/70 text-slate-400 hover:text-slate-100"
+                    }`}
+                  >
+                    {t.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <p className="mb-1.5 text-[11px] font-semibold text-slate-400">篇幅</p>
+              <div className="flex flex-wrap gap-1.5">
+                {LENGTHS.map((l) => (
+                  <button
+                    key={l.id}
+                    onClick={() => setLength(l.id)}
+                    className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold transition ${
+                      length === l.id ? "bg-emerald-400 text-slate-900" : "bg-slate-800/70 text-slate-400 hover:text-slate-100"
+                    }`}
+                  >
+                    {l.name}（{l.hint}）
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <p className="mb-1.5 text-[11px] font-semibold text-slate-400">自定义关键词（可选，逗号分隔）</p>
+              <input
+                value={keywords}
+                onChange={(e) => setKeywords(e.target.value)}
+                placeholder="季后赛、主场、纪录之夜"
+                className="field !py-1.5 !text-xs"
+              />
             </div>
           </div>
 
-          <div>
-            <p className="mb-1.5 text-[11px] font-semibold text-slate-400">篇幅</p>
-            <div className="flex flex-wrap gap-1.5">
-              {LENGTHS.map((l) => (
-                <button
-                  key={l.id}
-                  onClick={() => setLength(l.id)}
-                  className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold transition ${
-                    length === l.id ? "bg-emerald-400 text-slate-900" : "bg-slate-800/70 text-slate-400 hover:text-slate-100"
-                  }`}
-                >
-                  {l.name}（{l.hint}）
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <p className="mb-1.5 text-[11px] font-semibold text-slate-400">自定义关键词（可选，逗号分隔）</p>
-            <input
-              value={keywords}
-              onChange={(e) => setKeywords(e.target.value)}
-              placeholder="季后赛、主场、纪录之夜"
-              className="field !py-1.5 !text-xs"
-            />
-          </div>
-
-          <button
-            className="btn btn-primary w-full"
-            disabled={busy}
-            onClick={() => {
-              const next = variant + 1;
-              setVariant(next);
-              generate(next);
-            }}
-          >
-            {busy ? "生成中，正在抓取数据…" : "⚡ 生成文案"}
-          </button>
-          {result ? (
+          <div className="flex flex-wrap gap-2">
             <button
-              className="btn btn-ghost w-full"
+              className="btn btn-primary min-w-44 flex-1"
               disabled={busy}
               onClick={() => {
                 const next = variant + 1;
@@ -470,13 +647,26 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
                 generate(next);
               }}
             >
-              🎲 换一版（换措辞）
+              {busy ? "生成中，正在抓取数据…" : "⚡ 生成文案"}
             </button>
-          ) : null}
+            {result ? (
+              <button
+                className="btn btn-ghost"
+                disabled={busy}
+                onClick={() => {
+                  const next = variant + 1;
+                  setVariant(next);
+                  generate(next);
+                }}
+              >
+                🎲 换一版（换措辞）
+              </button>
+            ) : null}
+          </div>
         </div>
       </section>
 
-      {/* 右：输出 */}
+      {/* 下方：生成结果与编辑 */}
       <section className="space-y-4">
         {error ? (
           <div className="panel border-rose-500/40 p-3 text-[13px] text-rose-300">⚠️ {error}</div>
@@ -491,66 +681,130 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
           </div>
         ) : null}
 
-        <div className="panel space-y-3 p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <h2 className="text-sm font-bold text-white">3 · 编辑与发布</h2>
-            <div className="flex items-center gap-2">
-              {result?.generatedBy ? (
-                <span className={`chip ${result.generatedBy === "ai" ? "!text-orange-300" : "!text-sky-300"}`}>
-                  {result.generatedBy === "ai" ? "🤖 AI 生成" : "🧩 模板生成"}
-                </span>
-              ) : null}
-              <span className="text-[11px] text-slate-500">
-                {result ? `模板 ${result.templateName} · ` : ""}正文 {wordCount} 字
-              </span>
-            </div>
-          </div>
-          <div className="relative space-y-3">
-            <input
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder="标题（生成后可编辑）"
-              className="field font-semibold"
-            />
-            <textarea
-              value={body}
-              onChange={(e) => setBody(e.target.value)}
-              placeholder="点击左侧「生成文案」，正文会自动填入，可继续手动润色。"
-              rows={16}
-              className="field scroll-thin min-h-[320px] leading-relaxed"
-            />
-            {busy ? (
-              <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 rounded-lg bg-slate-950/70 backdrop-blur-sm">
-                <span className="h-9 w-9 animate-spin rounded-full border-[3px] border-orange-400 border-t-transparent" />
-                <p className="text-sm font-semibold text-slate-100">正在生成文案…</p>
-                <p className="text-[11px] text-slate-400">AI 正在整合所选数据源，完成后自动填入</p>
+        {dualNews ? (
+          <div className="relative">
+            <div className="grid items-stretch gap-4 lg:grid-cols-2">
+              {/* 左：原文完整中文翻译（对照参考） */}
+              <div className="panel flex h-[560px] flex-col p-4 lg:h-[600px]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h2 className="text-sm font-bold text-white">📰 原文中文翻译</h2>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {translation ? (
+                      <span className="flex overflow-hidden rounded-lg border border-white/10 text-[11px] font-semibold">
+                        <button
+                          type="button"
+                          aria-pressed={transView === "dual"}
+                          onClick={() => setTransView("dual")}
+                          className={`px-2 py-1 transition ${
+                            transView === "dual" ? "bg-orange-500/20 text-orange-200" : "bg-slate-900/50 text-slate-500 hover:text-slate-200"
+                          }`}
+                        >
+                          中英对照
+                        </button>
+                        <button
+                          type="button"
+                          aria-pressed={transView === "zh"}
+                          onClick={() => setTransView("zh")}
+                          className={`px-2 py-1 transition ${
+                            transView === "zh" ? "bg-orange-500/20 text-orange-200" : "bg-slate-900/50 text-slate-500 hover:text-slate-200"
+                          }`}
+                        >
+                          只看译文
+                        </button>
+                      </span>
+                    ) : null}
+                    {translation ? (
+                      <span className={`chip ${translation.scope === "full" ? "!text-sky-300" : "!text-amber-300"}`}>
+                        {translation.scope === "full" ? "完整全文翻译" : "原文仅提供摘要"}
+                      </span>
+                    ) : null}
+                    {translation ? (
+                      <button
+                        type="button"
+                        className="btn btn-ghost !px-2.5 !py-1 !text-[11px]"
+                        onClick={() => copyText(`${translation.titleZh}\n\n${translation.bodyZh}`, "译文")}
+                      >
+                        📋 复制译文
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+                <div className="scroll-thin mt-3 min-h-0 flex-1 overflow-y-auto rounded-xl border border-white/5 bg-slate-900/50 p-4">
+                  {translation ? (
+                    <>
+                      <h3 className="text-[15px] font-bold leading-snug text-slate-100">{translation.titleZh}</h3>
+                      {transView === "dual" ? (
+                        <p className="mt-1 text-[11px] italic leading-5 text-slate-500">{dualNews.headline}</p>
+                      ) : null}
+                      {dualNews.publishedAt ? (
+                        <p className="mt-1 text-[11px] text-slate-500">{dualNews.publishedAt.slice(0, 10)}</p>
+                      ) : null}
+                      {transView === "dual" && translation.pairs.length > 0 ? (
+                        <div className="mt-3 space-y-3">
+                          {translation.pairs.map((pair, idx) => (
+                            <div key={idx} className="border-b border-white/5 pb-3 last:border-b-0 last:pb-0">
+                              {pair.en ? (
+                                <p className="text-[11px] leading-5 text-slate-500">{pair.en}</p>
+                              ) : null}
+                              <p
+                                className={`whitespace-pre-line text-[13px] leading-7 text-slate-300 ${pair.en ? "mt-1.5" : ""}`}
+                              >
+                                {pair.zh}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="mt-3 space-y-3 text-[13px] leading-7 text-slate-300">
+                          {translation.bodyZh.split(/\n{2,}/).map((para, idx) => (
+                            <p key={idx} className="whitespace-pre-line">
+                              {para}
+                            </p>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <h3 className="text-[15px] font-bold leading-snug text-slate-100">{dualNews.headline}</h3>
+                      {dualNews.publishedAt ? (
+                        <p className="mt-1.5 text-[11px] text-slate-500">{dualNews.publishedAt.slice(0, 10)}</p>
+                      ) : null}
+                      <div className="mt-3 space-y-3 text-[13px] leading-7 text-slate-300">
+                        {(dualRawText ?? dualNews.description ?? "该新闻原文仅提供标题。")
+                          .split(/\n{2,}/)
+                          .map((para, idx) => (
+                            <p key={idx} className="whitespace-pre-line">
+                              {para}
+                            </p>
+                          ))}
+                      </div>
+                      <p className="mt-4 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-[11px] leading-relaxed text-amber-300">
+                        暂未生成中文翻译（AI 未启用或翻译失败），当前展示英文原文。前往「密钥设置」填入 DashScope Key 后重新生成，即可自动显示完整中文翻译。
+                      </p>
+                    </>
+                  )}
+                </div>
+                {dualNews.url ? (
+                  <a
+                    href={dualNews.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-2 self-end text-[11px] text-orange-300 hover:text-orange-200"
+                  >
+                    查看英文原文 ↗
+                  </a>
+                ) : null}
               </div>
-            ) : null}
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button className="btn btn-ghost !py-1.5 !text-xs" onClick={() => copyText(`${title}\n\n${body}`, "全文")}>
-              📋 复制全文
-            </button>
-            <button className="btn btn-ghost !py-1.5 !text-xs" onClick={() => copyText(title, "标题")}>
-              🏷️ 仅复制标题
-            </button>
-            <button className="btn btn-primary !py-1.5 !text-xs" onClick={saveDraft}>
-              💾 保存草稿
-            </button>
-            <Link href="/drafts" className="btn btn-ghost !py-1.5 !text-xs">
-              🗂️ 打开草稿箱
-            </Link>
-          </div>
-          {tags.length > 0 ? (
-            <div className="flex flex-wrap gap-1.5 border-t border-white/5 pt-3">
-              {tags.map((tag) => (
-                <span key={tag} className="chip">
-                  #{tag}
-                </span>
-              ))}
+
+              {/* 右：转写文案（可编辑） */}
+              {renderEditorPanel(true)}
             </div>
-          ) : null}
-        </div>
+            {busy ? busyOverlay : null}
+          </div>
+        ) : (
+          renderEditorPanel(false)
+        )}
 
         {result ? (
           <div className="panel space-y-2 p-4">
@@ -571,9 +825,10 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
           <div className="panel p-6 text-[13px] leading-relaxed text-slate-400">
             <p className="font-semibold text-slate-200">使用流程</p>
             <ol className="mt-2 list-decimal space-y-1 pl-5">
-              <li>在左侧自由勾选比赛、球员、新闻素材（可任意组合，也可都不选）；</li>
+              <li>在上方自由勾选比赛、球员、新闻素材（可任意组合，也可都不选）；</li>
               <li>挑选文体（9 种）、语气（5 种）与篇幅（3 档）；</li>
               <li>点击「生成文案」，系统会实时抓取比分、生涯数据与命中率并写成稿件；</li>
+              <li>只要选中新闻素材并生成（任意文体、可与其他数据源组合），结果区都会变成左右双框：左侧为原文的完整中文翻译（自动抓取全文，可切换中英逐段对照），右侧为可编辑的生成文案；</li>
               <li>不满意就点「换一版」，措辞会重新组合；</li>
               <li>润色后一键复制或存入草稿箱。</li>
             </ol>
