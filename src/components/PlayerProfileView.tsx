@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { getPlayerProfile } from "@/lib/nba/store";
-import type { PlayerProfile, StatSplit } from "@/lib/nba/types";
+import type { PlayerProfile, PlayerSeasonStat, StatSplit } from "@/lib/nba/types";
 
 function n1(v: number | null | undefined) {
   return v === null || v === undefined || !Number.isFinite(v) ? "—" : String(Math.round(v * 10) / 10);
@@ -130,7 +130,7 @@ export default function PlayerProfileView({ espnId }: { espnId: string }) {
         <SplitCard title="生涯季后赛" split={player.careerPlayoffs} />
       </section>
 
-      {/* 分赛季数据 */}
+      {/* 分赛季数据：常规赛 / 季后赛 分框竖向排列 */}
       <section className="space-y-3">
         <div className="flex items-end justify-between">
           <h2 className="text-base font-bold text-white">📈 分赛季历史数据</h2>
@@ -138,55 +138,8 @@ export default function PlayerProfileView({ espnId }: { espnId: string }) {
             常规赛 {regular.length} 季{playoffs.length > 0 ? ` · 季后赛 ${playoffs.length} 次` : ""}
           </span>
         </div>
-        <div className="panel table-wrap p-2">
-          <table className="data">
-            <thead>
-              <tr>
-                <th>赛季</th>
-                <th>类型</th>
-                <th>球队</th>
-                <th>场次</th>
-                <th>时间</th>
-                <th>得分</th>
-                <th>篮板</th>
-                <th>助攻</th>
-                <th>抢断</th>
-                <th>盖帽</th>
-                <th>投篮%</th>
-                <th>三分%</th>
-                <th>罚球%</th>
-              </tr>
-            </thead>
-            <tbody>
-              {player.seasons.map((s) => (
-                <tr key={`${s.seasonLabel}-${s.seasonType}`}>
-                  <td className="font-semibold text-slate-100">{s.seasonLabel}</td>
-                  <td className={s.seasonType === "playoffs" ? "text-orange-300" : "text-slate-500"}>
-                    {s.seasonType === "playoffs" ? "季后赛" : "常规赛"}
-                  </td>
-                  <td className="text-slate-400">{s.teamAbbr ?? "—"}</td>
-                  <td>{s.gp ?? "—"}</td>
-                  <td>{n1(s.min)}</td>
-                  <td className="font-bold text-orange-300">{n1(s.pts)}</td>
-                  <td>{n1(s.reb)}</td>
-                  <td>{n1(s.ast)}</td>
-                  <td>{n1(s.stl)}</td>
-                  <td>{n1(s.blk)}</td>
-                  <td>{pct(s.fgp)}</td>
-                  <td>{pct(s.tpp)}</td>
-                  <td>{pct(s.ftp)}</td>
-                </tr>
-              ))}
-              {player.seasons.length === 0 ? (
-                <tr>
-                  <td colSpan={13} className="py-8 text-center text-slate-500">
-                    暂未抓取到分赛季数据（可能该球员无 NBA 常规赛出场记录，或数据源暂时不可用）。
-                  </td>
-                </tr>
-              ) : null}
-            </tbody>
-          </table>
-        </div>
+        <SeasonTable title="常规赛" rows={regular} />
+        <SeasonTable title="季后赛" rows={playoffs} />
       </section>
 
       <div className="grid gap-6 lg:grid-cols-2">
@@ -295,6 +248,63 @@ function SplitCard({ title, split, accent }: { title: string; split: StatSplit |
       ) : (
         <p className="mt-3 text-sm text-slate-500">暂无数据</p>
       )}
+    </div>
+  );
+}
+
+/** 单类赛季汇总表（常规赛 / 季后赛 各自独立成框） */
+function SeasonTable({ title, rows }: { title: string; rows: PlayerSeasonStat[] }) {
+  return (
+    <div className="panel table-wrap p-2">
+      <div className="flex items-center justify-between px-2 py-1.5">
+        <span className="text-[12px] font-bold text-slate-200">{title}</span>
+        <span className="text-[11px] text-slate-500">{rows.length > 0 ? `${rows.length} 季` : ""}</span>
+      </div>
+      <table className="data">
+        <thead>
+          <tr>
+            <th>赛季</th>
+            <th>球队</th>
+            <th>场次</th>
+            <th>时间</th>
+            <th>得分</th>
+            <th>篮板</th>
+            <th>助攻</th>
+            <th>抢断</th>
+            <th>盖帽</th>
+            <th>投篮%</th>
+            <th>三分%</th>
+            <th>罚球%</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((s) => (
+            <tr key={s.seasonLabel}>
+              <td className="font-semibold text-slate-100">{s.seasonLabel}</td>
+              <td className="text-slate-400">{s.teamAbbr ?? "—"}</td>
+              <td>{s.gp ?? "—"}</td>
+              <td>{n1(s.min)}</td>
+              <td className="font-bold text-orange-300">{n1(s.pts)}</td>
+              <td>{n1(s.reb)}</td>
+              <td>{n1(s.ast)}</td>
+              <td>{n1(s.stl)}</td>
+              <td>{n1(s.blk)}</td>
+              <td>{pct(s.fgp)}</td>
+              <td>{pct(s.tpp)}</td>
+              <td>{pct(s.ftp)}</td>
+            </tr>
+          ))}
+          {rows.length === 0 ? (
+            <tr>
+              <td colSpan={12} className="py-6 text-center text-slate-500">
+                {title === "季后赛"
+                  ? "暂无季后赛出场记录。"
+                  : "暂未抓取到常规赛数据（可能该球员无 NBA 出场记录，或数据源暂时不可用）。"}
+              </td>
+            </tr>
+          ) : null}
+        </tbody>
+      </table>
     </div>
   );
 }

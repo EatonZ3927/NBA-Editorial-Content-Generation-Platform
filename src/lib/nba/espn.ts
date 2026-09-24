@@ -1,4 +1,7 @@
 import type {
+  BoxscorePlayer,
+  GameDetail,
+  GameDetailTeam,
   GameLeader,
   GameSummary,
   GameTeam,
@@ -7,7 +10,9 @@ import type {
   PlayerGameLogEntry,
   PlayerProfile,
   PlayerSeasonStat,
+  QuarterScore,
   StatSplit,
+  TeamStatCompare,
 } from "./types";
 
 const ESPN_SITE = "https://site.web.api.espn.com";
@@ -612,4 +617,180 @@ export function currentNbaSeasonYear(now = new Date()): number {
 export function seasonLabel(year: number): string {
   const next = String((year + 1) % 100).padStart(2, "0");
   return `${year}-${next}`;
+}
+
+/* ------------------------------ 比赛详情 ------------------------------ */
+
+/** 球队数据对比的指标定义；altKey 为命中-出手文本（命中率行一并展示） */
+const TEAM_STAT_SPECS: {
+  key: string;
+  label: string;
+  altKey?: string;
+  lowerIsBetter?: boolean;
+}[] = [
+  { key: "fieldGoalPct", label: "投篮命中率", altKey: "fieldGoalsMade-fieldGoalsAttempted" },
+  {
+    key: "threePointFieldGoalPct",
+    label: "三分命中率",
+    altKey: "threePointFieldGoalsMade-threePointFieldGoalsAttempted",
+  },
+  { key: "freeThrowPct", label: "罚球命中率", altKey: "freeThrowsMade-freeThrowsAttempted" },
+  { key: "totalRebounds", label: "总篮板" },
+  { key: "offensiveRebounds", label: "前场篮板" },
+  { key: "assists", label: "助攻" },
+  { key: "steals", label: "抢断" },
+  { key: "blocks", label: "盖帽" },
+  { key: "totalTurnovers", label: "失误", lowerIsBetter: true },
+  { key: "fouls", label: "犯规", lowerIsBetter: true },
+  { key: "fastBreakPoints", label: "快攻得分" },
+  { key: "pointsInPaint", label: "禁区得分" },
+  { key: "turnoverPoints", label: "利用失误得分" },
+  { key: "largestLead", label: "最大领先" },
+];
+
+function mapBoxscorePlayers(teamBlock: Json): BoxscorePlayer[] {
+  const statGroup = ((teamBlock.statistics as Json[] | undefined) ?? [])[0];
+  const labels = (statGroup?.labels as string[] | undefined) ?? [];
+  const at = (stats: string[], name: string): string | null => {
+    const i = labels.indexOf(name);
+    return i >= 0 && i < stats.length ? stats[i] : null;
+  };
+  const athletes = (statGroup?.athletes as Json[] | undefined) ?? [];
+  return athletes.map((entry) => {
+    const athlete = (entry.athlete as Json | undefined) ?? {};
+    const stats = (entry.stats as string[] | undefined) ?? [];
+    return {
+      athleteId: str(athlete.id) ?? "",
+      name: str(athlete.displayName) ?? str(athlete.shortName) ?? "",
+      headshot: str((athlete.headshot as Json | undefined)?.href),
+      position: str((athlete.position as Json | undefined)?.abbreviation),
+      jersey: str(athlete.jersey),
+      starter: Boolean(entry.starter),
+      didNotPlay: Boolean(entry.didNotPlay),
+      reason: str(entry.reason),
+      minutes: num(at(stats, "MIN")),
+      pts: num(at(stats, "PTS")),
+      reb: num(at(stats, "REB")),
+      ast: num(at(stats, "AST")),
+      stl: num(at(stats, "STL")),
+      blk: num(at(stats, "BLK")),
+      tov: num(at(stats, "TO")),
+      pf: num(at(stats, "PF")),
+      plusMinus: num(at(stats, "+/-")),
+      fg: at(stats, "FG"),
+      tp: at(stats, "3PT"),
+      ft: at(stats, "FT"),
+    } satisfies BoxscorePlayer;
+  });
+}
+
+/**
+ * 单场详情：逐节比分、双方 boxscore、球队数据对比。
+ * 与比分接口同域（site.web.api.espn.com），已验证 ACAO:*，浏览器可直连。
+ */
+export async function fetchGameSummary(gameId: string): Promise<GameDetail> {
+  const url = `${ESPN_SITE}/apis/site/v2/sports/basketball/nba/summary?event=${gameId}&lang=en`;
+  const data = await getJson<Json>(url, 12000);
+  const header = (data.header as Json | undefined) ?? {};
+  const comp = ((header.competitions as Json[] | undefined) ?? [])[0] ?? {};
+  const statusType = ((comp.status as Json | undefined)?.type as Json | undefined) ?? {};
+  const competitors = (comp.competitors as Json[] | undefined) ?? [];
+  const awayRaw = competitors.find((c) => str(c.homeAway) === "away") ?? competitors[0] ?? {};
+  const homeRaw = competitors.find((c) => str(c.homeAway) === "home") ?? competitors[1] ?? {};
+
+  // boxscore 按队名缩写索引，再指派给主/客队
+  const playersByAbbr = new Map<string, BoxscorePlayer[]>();
+  const playerBlocks = ((data.boxscore as Json | undefined)?.players as Json[] | undefined) ?? [];
+  for (const block of playerBlocks) {
+    const abbr = str((block.team as Json | undefined)?.abbreviation) ?? "";
+    if (abbr) playersByAbbr.set(abbr, mapBoxscorePlayers(block));
+  }
+
+  const mapSide = (raw: Json): GameDetailTeam => {
+    const team = (raw.team as Json | undefined) ?? {};
+    const abbr = str(team.abbreviation) ?? "";
+    const records = (raw.record as Json[] | undefined) ?? [];
+    return {
+      abbr,
+      name: str(team.shortDisplayName) ?? str(team.name) ?? "",
+      displayName: str(team.displayName) ?? str(team.name) ?? "",
+      logo: str(team.logo) ?? str(((team.logos as Json[] | undefined) ?? [])[0]?.href),
+      score: num(raw.score),
+      record: str(records[0]?.summary),
+      winner: Boolean(raw.winner),
+      players: playersByAbbr.get(abbr) ?? [],
+    };
+  };
+  const away = mapSide(awayRaw);
+  const home = mapSide(homeRaw);
+
+  // 逐节比分
+  const awayLines = (awayRaw.linescores as Json[] | undefined) ?? [];
+  const homeLines = (homeRaw.linescores as Json[] | undefined) ?? [];
+  const quarterCount = Math.max(awayLines.length, homeLines.length);
+  const quarters: QuarterScore[] = Array.from({ length: quarterCount }, (_, i) => ({
+    label: i < 4 ? String(i + 1) : i === 4 ? "OT" : `OT${i - 3}`,
+    away: num(awayLines[i]?.displayValue) ?? num(awayLines[i]?.value),
+    home: num(homeLines[i]?.displayValue) ?? num(homeLines[i]?.value),
+  }));
+
+  // 球队数据对比
+  const teamStatMap = new Map<string, Map<string, string>>();
+  const teamBlocks = ((data.boxscore as Json | undefined)?.teams as Json[] | undefined) ?? [];
+  for (const block of teamBlocks) {
+    const abbr = str((block.team as Json | undefined)?.abbreviation) ?? "";
+    const m = new Map<string, string>();
+    for (const s of (block.statistics as Json[] | undefined) ?? []) {
+      const name = str(s.name);
+      const displayValue = str(s.displayValue);
+      if (name && displayValue) m.set(name, displayValue);
+    }
+    if (abbr) teamStatMap.set(abbr, m);
+  }
+  const awayStats = teamStatMap.get(away.abbr) ?? new Map<string, string>();
+  const homeStats = teamStatMap.get(home.abbr) ?? new Map<string, string>();
+  const fmtStat = (dv: string | null, stats: Map<string, string>, altKey?: string): string => {
+    if (!dv) return "—";
+    const alt = altKey ? stats.get(altKey) : null;
+    return altKey ? `${dv}%（${alt ?? "—"}）` : dv;
+  };
+  const teamStats: TeamStatCompare[] = TEAM_STAT_SPECS.map((spec) => {
+    const awayDisplay = awayStats.get(spec.key) ?? null;
+    const homeDisplay = homeStats.get(spec.key) ?? null;
+    return {
+      key: spec.key,
+      label: spec.label,
+      away: num(awayDisplay),
+      home: num(homeDisplay),
+      awayDisplay: fmtStat(awayDisplay, awayStats, spec.altKey),
+      homeDisplay: fmtStat(homeDisplay, homeStats, spec.altKey),
+      lowerIsBetter: spec.lowerIsBetter,
+    };
+  }).filter((row) => row.away !== null || row.home !== null);
+
+  // 赛季阶段与系列赛比分（常规赛的 series 是交手战绩，易误读，仅季后赛展示）
+  const season = (header.season as Json | undefined) ?? {};
+  const seasonTypeNum = num(season.type);
+  const seasonType: GameDetail["seasonType"] =
+    seasonTypeNum === 3 ? "post" : seasonTypeNum === 1 ? "pre" : "regular";
+  const seriesEntry = ((comp.series as Json[] | undefined) ?? [])[0];
+
+  const gameInfo = (data.gameInfo as Json | undefined) ?? {};
+  return {
+    id: str(header.id) ?? gameId,
+    gameDate: (str(comp.date) ?? "").slice(0, 10),
+    statusState: (str(statusType.state) ?? "pre") as GameDetail["statusState"],
+    statusDetail: str(statusType.detail) ?? str(statusType.description) ?? "",
+    completed: Boolean(statusType.completed),
+    seasonType,
+    series: seasonType === "post" ? str(seriesEntry?.summary) : null,
+    venue:
+      str((comp.venue as Json | undefined)?.fullName) ??
+      str((gameInfo.venue as Json | undefined)?.fullName),
+    attendance: num(gameInfo.attendance),
+    away,
+    home,
+    quarters,
+    teamStats,
+  };
 }

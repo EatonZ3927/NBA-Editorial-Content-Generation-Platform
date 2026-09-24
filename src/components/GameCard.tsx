@@ -1,6 +1,5 @@
 import Link from "next/link";
 import type { GameSummary } from "@/lib/nba/types";
-import { teamShort, teamZh } from "@/lib/nba/teams";
 
 /**
  * 本场热点球员标签：两队得分王优先，篮板/助攻王补充，去重后最多 3 个。
@@ -46,7 +45,7 @@ export default function GameCard({ game }: { game: GameSummary }) {
 
       <div className="flex items-center justify-between gap-3">
         <TeamRow
-          name={teamZh(game.away.abbr)}
+          name={game.away.name || game.away.abbr}
           abbr={game.away.abbr}
           score={game.away.score}
           record={game.away.record}
@@ -55,7 +54,7 @@ export default function GameCard({ game }: { game: GameSummary }) {
         />
         <span className="shrink-0 px-1 text-[11px] font-semibold text-slate-600">VS</span>
         <TeamRow
-          name={teamZh(game.home.abbr)}
+          name={game.home.name || game.home.abbr}
           abbr={game.home.abbr}
           score={game.home.score}
           record={game.home.record}
@@ -68,11 +67,11 @@ export default function GameCard({ game }: { game: GameSummary }) {
       {!pre ? (
         <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-400">
           <div className="panel-soft px-2.5 py-2">
-            <span className="text-slate-500">{teamShort(game.away.abbr)} 核心：</span>
+            <span className="text-slate-500">{game.away.name || game.away.abbr} 核心：</span>
             <span className="text-slate-200">{leaderText(game, "away")}</span>
           </div>
           <div className="panel-soft px-2.5 py-2">
-            <span className="text-slate-500">{teamShort(game.home.abbr)} 核心：</span>
+            <span className="text-slate-500">{game.home.name || game.home.abbr} 核心：</span>
             <span className="text-slate-200">{leaderText(game, "home")}</span>
           </div>
         </div>
@@ -89,12 +88,22 @@ export default function GameCard({ game }: { game: GameSummary }) {
         {game.odds?.overUnder ? <span className="chip">Σ {game.odds.overUnder}</span> : null}
       </div>
 
-      <Link
-        href={`/editor?gameId=${game.id}&gameDate=${game.gameDate}`}
-        className="btn btn-ghost w-full !py-1.5 !text-[12px]"
-      >
-        ✍️ 用这场比赛生成文案
-      </Link>
+      <div className="flex gap-2">
+        {!pre ? (
+          <Link
+            href={`/game?id=${game.id}&date=${game.gameDate}`}
+            className="btn btn-ghost flex-1 !py-1.5 !text-[12px]"
+          >
+            📊 比赛详情
+          </Link>
+        ) : null}
+        <Link
+          href={`/editor?gameId=${game.id}&gameDate=${game.gameDate}`}
+          className="btn btn-ghost flex-1 !py-1.5 !text-[12px]"
+        >
+          ✍️ 生成文案
+        </Link>
+      </div>
     </article>
   );
 }

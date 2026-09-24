@@ -16,6 +16,7 @@ import {
   fetchAthleteOverview,
   fetchEspnLeaders,
   fetchEspnPlayerSeasonHistory,
+  fetchGameSummary,
   fetchNews,
   fetchScoreboard,
   fetchScoreboardRange,
@@ -25,6 +26,8 @@ import {
 import { PLAYER_ZH as playerZhMap, STAR_PICKS, playerZh, teamZh } from "./teams";
 import type {
   DataSource,
+  GameDetail,
+  GameDetailResult,
   GameSummary,
   LeaderRow,
   NewsItem,
@@ -537,3 +540,46 @@ export function deleteDraft(id: number): void {
 }
 
 export { currentNbaSeasonYear, seasonLabel };
+
+/* ------------------------------ 比赛详情 ------------------------------ */
+
+const GAME_DETAIL_TTL_POST_MS = 24 * 3600 * 1000; // 已结束：24 小时（结果基本不变，留一天余地）
+const GAME_DETAIL_TTL_IN_MS = 30 * 1000; // 直播中：30 秒
+const GAME_DETAIL_TTL_PRE_MS = 5 * 60 * 1000; // 未开赛：5 分钟
+
+function gameDetailTtl(detail: GameDetail): number {
+  if (detail.statusState === "post") return GAME_DETAIL_TTL_POST_MS;
+  if (detail.statusState === "in") return GAME_DETAIL_TTL_IN_MS;
+  return GAME_DETAIL_TTL_PRE_MS;
+}
+
+/** 按缓存内比赛自身的状态决定 TTL（已结束的比赛不应被 30 秒的直播 TTL 误伤） */
+function cacheGetGameDetail(key: string): GameDetail | null {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return null;
+    const box = JSON.parse(raw) as CacheBox<GameDetail>;
+    if (typeof box.at !== "number" || !box.value) return null;
+    return Date.now() - box.at <= gameDetailTtl(box.value) ? box.value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 单场详情（逐节比分 / boxscore / 球队数据对比）。
+ * 按比赛状态分级缓存；网络失败时回退到过期缓存，再没有则离线。
+ */
+export async function getGameDetail(gameId: string): Promise<GameDetailResult> {
+  const key = `nba:game-detail:v3:${gameId}`; // v3：修复队标读取（header 里为 logos 数组）
+  const fresh = cacheGetGameDetail(key);
+  if (fresh) return { detail: fresh, source: "cache", fetchedAt: nowIso() };
+  try {
+    const detail = await fetchGameSummary(gameId);
+    cacheSet(key, detail);
+    return { detail, source: "live", fetchedAt: nowIso() };
+  } catch {
+    const stale = cacheGetStale<GameDetail>(key);
+    return { detail: stale, source: stale ? "cache" : "offline", fetchedAt: nowIso() };
+  }
+}

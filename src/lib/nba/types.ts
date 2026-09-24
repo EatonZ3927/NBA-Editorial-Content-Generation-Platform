@@ -162,3 +162,83 @@ export type LeaderRow = {
   ftp: number | null;
   tov: number | null;
 };
+
+/* ------------------------------ 比赛详情 ------------------------------ */
+
+/** 逐节比分（OT 为加时） */
+export type QuarterScore = {
+  label: string;
+  away: number | null;
+  home: number | null;
+};
+
+/** 球队数据对比行（双向条形图） */
+export type TeamStatCompare = {
+  key: string;
+  label: string;
+  away: number | null;
+  home: number | null;
+  awayDisplay: string;
+  homeDisplay: string;
+  lowerIsBetter?: boolean;
+};
+
+/** boxscore 球员行 */
+export type BoxscorePlayer = {
+  athleteId: string;
+  name: string;
+  headshot: string | null;
+  position: string | null;
+  jersey: string | null;
+  starter: boolean;
+  didNotPlay: boolean;
+  reason: string | null;
+  minutes: number | null;
+  pts: number | null;
+  reb: number | null;
+  ast: number | null;
+  stl: number | null;
+  blk: number | null;
+  tov: number | null;
+  pf: number | null;
+  plusMinus: number | null;
+  fg: string | null;
+  tp: string | null;
+  ft: string | null;
+};
+
+export type GameDetailTeam = {
+  abbr: string;
+  /** 英文队名（shortDisplayName，如 Knicks / Celtics） */
+  name: string;
+  displayName: string;
+  logo: string | null;
+  score: number | null;
+  record: string | null;
+  winner: boolean;
+  players: BoxscorePlayer[];
+};
+
+export type GameDetail = {
+  id: string;
+  /** 比赛日期 YYYY-MM-DD（UTC 开赛时间切片，仅兜底用；展示优先取 URL 的 date 参数） */
+  gameDate: string;
+  statusState: GameStatusState;
+  statusDetail: string;
+  completed: boolean;
+  seasonType: "pre" | "regular" | "post";
+  /** 季后赛系列赛比分；常规赛/季前赛为 null */
+  series: string | null;
+  venue: string | null;
+  attendance: number | null;
+  away: GameDetailTeam;
+  home: GameDetailTeam;
+  quarters: QuarterScore[];
+  teamStats: TeamStatCompare[];
+};
+
+export type GameDetailResult = {
+  detail: GameDetail | null;
+  source: DataSource;
+  fetchedAt: string;
+};
