@@ -1,5 +1,7 @@
 "use client";
 
+import { todayIso } from "@/lib/nba/dates";
+
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getUserApiKey } from "@/components/KeySetup";
@@ -77,7 +79,7 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
   const toggleSource = (key: "game" | "player" | "news") =>
     setSources((s) => ({ ...s, [key]: !s[key] }));
   const [gameDate, setGameDate] = useState(
-    initial.gameDate ?? initial.games?.[0]?.gameDate ?? new Date().toISOString().slice(0, 10),
+    initial.gameDate ?? initial.games?.[0]?.gameDate ?? todayIso(),
   );
   const [games, setGames] = useState<GameSummary[]>(initial.games ?? []);
   const [gameId, setGameId] = useState(initial.gameId ?? initial.games?.[0]?.id ?? "");

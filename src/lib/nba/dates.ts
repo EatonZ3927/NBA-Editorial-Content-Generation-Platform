@@ -1,10 +1,31 @@
+export const DISPLAY_TIME_ZONE = "Asia/Shanghai";
+
+export function dateInZone(iso: string | number | Date, timeZone = DISPLAY_TIME_ZONE): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(d);
+  const part = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
 export function todayIso(): string {
-  return new Date().toISOString().slice(0, 10);
+  return dateInZone(Date.now());
 }
 
 export function normalizeDate(input?: string | null): string {
   if (!input || !/^\d{4}-\d{2}-\d{2}$/.test(input)) return todayIso();
+  const parsed = new Date(`${input}T12:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== input) return todayIso();
   return input;
+}
+
+/** ESPN 按美国东部比赛日查询；覆盖北京时间自然日的两端，兼容夏令时。 */
+export function espnQueryDates(date: string): string[] {
+  const start = new Date(`${date}T00:00:00+08:00`).getTime();
+  return [...new Set([start, start + 24 * 3600 * 1000 - 1]
+    .map((time) => dateInZone(time, "America/New_York")))];
 }
 
 export function shiftDate(date: string, days: number): string {
@@ -25,11 +46,24 @@ export function timeZh(iso?: string | null): string {
   if (!iso) return "";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  const hh = String(d.getUTCHours()).padStart(2, "0");
-  const mi = String(d.getUTCMinutes()).padStart(2, "0");
-  return `${mm}-${dd} ${hh}:${mi} UTC`;
+  const time = new Intl.DateTimeFormat("en-GB", {
+    timeZone: DISPLAY_TIME_ZONE, hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).format(d);
+  return `${dateInZone(d).slice(5)} ${time} 北京时间`;
+}
+
+/** 比赛卡片保留英文日期及 AM/PM 表达，始终展示北京时间。 */
+export function gameTimeEn(iso?: string | null): string {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const day = new Intl.DateTimeFormat("en-GB", {
+    timeZone: DISPLAY_TIME_ZONE, month: "short", day: "numeric",
+  }).format(date);
+  const time = new Intl.DateTimeFormat("en-US", {
+    timeZone: DISPLAY_TIME_ZONE, hour: "numeric", minute: "2-digit", hour12: true,
+  }).format(date);
+  return `${day}, ${time} GMT+8`;
 }
 
 export function relativeZh(iso?: string | null): string {

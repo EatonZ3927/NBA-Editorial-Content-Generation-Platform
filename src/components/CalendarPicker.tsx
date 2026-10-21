@@ -2,11 +2,12 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { todayIso } from "@/lib/nba/dates";
 
 /**
  * 月历弹窗日期选择器：点击触发按钮后弹出一个小日历窗口，
  * 带打开/收起动画；选中日期后回调 onSelect 并自动关闭。
- * 所有日期计算使用 UTC，与服务端 YYYY-MM-DD 口径一致。
+ * 日期值按北京时间；月历格子使用 UTC 运算，避免运行设备时区影响日期加减。
  *
  * 弹窗通过 React Portal 挂载到 document.body 并使用 position: fixed 定位 +
  * 顶层 z-index，确保始终渲染在页面最上层（父级 .panel 的 backdrop-filter
@@ -44,7 +45,7 @@ export default function CalendarPicker({
   onSelect: (date: string) => void;
   label?: string;
 }) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayIso();
   const [open, setOpen] = useState(false);
   const [closing, setClosing] = useState(false);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);

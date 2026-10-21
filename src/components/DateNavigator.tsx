@@ -3,7 +3,7 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTransition } from "react";
 import CalendarPicker from "@/components/CalendarPicker";
-import { formatDateZh, shiftDate } from "@/lib/nba/dates";
+import { formatDateZh, shiftDate, todayIso } from "@/lib/nba/dates";
 
 export default function DateNavigator({ date, basePath = "/scores" }: { date: string; basePath?: string }) {
   const router = useRouter();
@@ -27,7 +27,7 @@ export default function DateNavigator({ date, basePath = "/scores" }: { date: st
       <button className="btn btn-ghost !px-2.5 !py-1.5 !text-xs" onClick={() => go(shiftDate(date, 1))}>
         后一天 →
       </button>
-      <button className="btn btn-ghost !px-2.5 !py-1.5 !text-xs" onClick={() => go(new Date().toISOString().slice(0, 10))}>
+      <button className="btn btn-ghost !px-2.5 !py-1.5 !text-xs" onClick={() => go(todayIso())}>
         今天
       </button>
       <span className="ml-auto text-xs text-slate-400">

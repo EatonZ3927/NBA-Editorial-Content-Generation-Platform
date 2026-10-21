@@ -2,9 +2,11 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { useEffect, useState } from "react";
-import { formatDateZh } from "@/lib/nba/dates";
+import { useCallback, useState } from "react";
+import { formatDateZh, timeZh } from "@/lib/nba/dates";
 import { getGameDetail } from "@/lib/nba/store";
+import { gameDetailRefreshMs } from "@/lib/nba/freshness";
+import { useLiveResult } from "@/lib/nba/useLiveResult";
 import type {
   BoxscorePlayer,
   GameDetail,
@@ -55,40 +57,8 @@ export default function GameDetailView() {
   const params = useSearchParams();
   const id = params.get("id") ?? "";
   const date = params.get("date") ?? "";
-  // state 记录结果对应的 id：渲染时用「state.id === 当前 id」派生当前结果，
-  // 切换比赛时旧数据自然失效，无需在 effect 里同步重置 state
-  const [state, setState] = useState<{ id: string; result: GameDetailResult } | null>(null);
-
-  useEffect(() => {
-    if (!id) return;
-    let alive = true;
-    let timer: number | undefined;
-    const load = async () => {
-      try {
-        const r = await getGameDetail(id);
-        if (!alive) return;
-        setState({ id, result: r });
-        // 直播中的比赛每 30 秒自动刷新
-        if (r.detail?.statusState === "in") {
-          timer = window.setTimeout(load, 30000);
-        }
-      } catch {
-        if (alive) {
-          setState({
-            id,
-            result: { detail: null, source: "offline", fetchedAt: new Date().toISOString() },
-          });
-        }
-      }
-    };
-    load();
-    return () => {
-      alive = false;
-      if (timer) window.clearTimeout(timer);
-    };
-  }, [id]);
-
-  const result = state && state.id === id ? state.result : null;
+  const load = useCallback((force: boolean): Promise<GameDetailResult> => getGameDetail(id, { force }), [id]);
+  const { result, refreshing, refresh } = useLiveResult(id, load, gameDetailRefreshMs);
 
   if (!id) {
     return (
@@ -111,7 +81,8 @@ export default function GameDetailView() {
   if (!detail) {
     return (
       <div className="panel mx-auto max-w-3xl p-8 text-center">
-        <p className="text-sm text-slate-300">暂时无法加载这场比赛的详细数据（网络异常且本机无缓存）。</p>
+        <p role="alert" className="text-sm text-slate-300">{result.error ?? "暂时无法加载这场比赛的详细数据。"}</p>
+        <button type="button" onClick={refresh} disabled={refreshing} className="btn btn-ghost mt-4 !text-xs">{refreshing ? "刷新中…" : "重新获取"}</button>
         <Link href={date ? `/scores?date=${date}` : "/scores"} className="btn btn-ghost mt-4 inline-block !py-1.5 !text-[12px]">
           ← 返回比分中心
         </Link>
@@ -119,7 +90,7 @@ export default function GameDetailView() {
     );
   }
 
-  const displayDate = date || detail.gameDate;
+  const displayDate = detail.gameDate || date;
   const live = detail.statusState === "in";
   const pre = detail.statusState === "pre";
   const focusAway = pickFocus(detail.away.players);
@@ -129,22 +100,27 @@ export default function GameDetailView() {
     <div className="mx-auto max-w-3xl space-y-6">
       <header className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <Link href={date ? `/scores?date=${date}` : "/scores"} className="text-[12px] text-slate-500 hover:text-orange-300">
+          <Link href={displayDate ? `/scores?date=${displayDate}` : "/scores"} className="text-[12px] text-slate-500 hover:text-orange-300">
             ← 返回比分中心
           </Link>
           <h1 className="mt-1 text-2xl font-black text-white">
             {detail.away.name || detail.away.abbr} @ {detail.home.name || detail.home.abbr}
           </h1>
           <p className="mt-1 text-sm text-slate-400">
-            {displayDate ? formatDateZh(displayDate) : "日期待定"} · {SEASON_TYPE_LABEL[detail.seasonType]} · 数据源{" "}
+            {displayDate ? formatDateZh(displayDate) : "日期待定"} · 北京时间 · {SEASON_TYPE_LABEL[detail.seasonType]} · 数据源{" "}
             {result.source === "live" ? "ESPN 实时" : result.source === "cache" ? "本机缓存" : "离线"}
             {live ? " · 每 30 秒自动刷新" : ""}
           </p>
+          {result.fetchedAt ? <p className="mt-1 text-xs text-slate-500">上次更新：{timeZh(result.fetchedAt)}</p> : null}
         </div>
+        <button type="button" onClick={refresh} disabled={refreshing} className="btn btn-ghost !text-xs">{refreshing ? "刷新中…" : "立即刷新"}</button>
         <span className="chip">
           {live ? "🔴 直播中" : pre ? "🕒 未开赛" : "🏁 已结束"}
         </span>
       </header>
+
+      {result.error ? <div role="alert" className="panel p-4 text-sm text-amber-300">{result.error}{result.stale ? " 当前展示上次成功获取的缓存数据。" : ""}</div> : null}
+      {result.incomplete ? <div className="panel p-4 text-sm text-slate-400">上游暂未提供完整技术统计，将{live ? "每 30 秒" : "每分钟"}补抓，最多自动重试五次；仍未补齐时可点击“立即刷新”。</div> : null}
 
       <ScoreHero detail={detail} />
 

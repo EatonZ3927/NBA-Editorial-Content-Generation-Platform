@@ -45,7 +45,9 @@ export type ScoreboardResult = {
   date: string;
   source: DataSource;
   games: GameSummary[];
-  fetchedAt: string;
+  fetchedAt: string | null;
+  stale?: boolean;
+  error?: string;
 };
 
 export type NewsItem = {
@@ -87,6 +89,8 @@ export type PlayerSeasonStat = {
   tpp: number | null;
   ftp: number | null;
   source: DataSource;
+  /** game-log 表示汇总接口尚未更新，按当季常规赛逐场记录计算。 */
+  provenance?: "official" | "game-log";
 };
 
 export type PlayerGameLogEntry = {
@@ -135,6 +139,10 @@ export type PlayerProfile = {
   experience: string | null;
   active: boolean;
   currentSeason: StatSplit | null;
+  requestedSeasonYear: number;
+  currentSeasonYear: number | null;
+  currentSeasonStatus: "official" | "game-log" | "pending" | "error";
+  error?: string;
   careerRegular: StatSplit | null;
   careerPlayoffs: StatSplit | null;
   seasons: PlayerSeasonStat[];
@@ -221,7 +229,7 @@ export type GameDetailTeam = {
 
 export type GameDetail = {
   id: string;
-  /** 比赛日期 YYYY-MM-DD（UTC 开赛时间切片，仅兜底用；展示优先取 URL 的 date 参数） */
+  /** 北京时间比赛日期 YYYY-MM-DD */
   gameDate: string;
   statusState: GameStatusState;
   statusDetail: string;
@@ -240,5 +248,8 @@ export type GameDetail = {
 export type GameDetailResult = {
   detail: GameDetail | null;
   source: DataSource;
-  fetchedAt: string;
+  fetchedAt: string | null;
+  stale?: boolean;
+  error?: string;
+  incomplete?: boolean;
 };

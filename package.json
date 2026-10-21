@@ -6,6 +6,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
+    "test:scores": "node --test scripts/test-scores.cjs",
+    "test:players": "node --test scripts/test-player-seasons.cjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

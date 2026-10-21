@@ -14,6 +14,7 @@ import type {
   StatSplit,
   TeamStatCompare,
 } from "./types";
+import { dateInZone, espnQueryDates, shiftDate } from "./dates";
 
 const ESPN_SITE = "https://site.web.api.espn.com";
 const ESPN_CORE = "https://sports.core.api.espn.com";
@@ -32,10 +33,16 @@ async function getJson<T>(url: string, timeoutMs = 9000): Promise<T> {
       signal: controller.signal,
       cache: "no-store",
     });
-    if (!res.ok) throw new Error(`upstream ${res.status} for ${url}`);
+    if (!res.ok) throw new UpstreamError(res.status, url);
     return (await res.json()) as T;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+class UpstreamError extends Error {
+  constructor(public readonly status: number, url: string) {
+    super(`upstream ${status} for ${url}`);
   }
 }
 
@@ -46,20 +53,53 @@ export function espnDateParam(date: string): string {
 }
 
 export async function fetchScoreboard(date: string): Promise<GameSummary[]> {
-  const url = `${ESPN_SITE}/apis/site/v2/sports/basketball/nba/scoreboard?dates=${espnDateParam(date)}&lang=en`;
-  const data = await getJson<{ events?: Json[] }>(url);
-  const events = data.events ?? [];
-  return events.map((event) => mapEvent(event, date));
+  // 两个来源日都必须成功，避免把不完整结果缓存成“当日全部比赛”。
+  const days = await Promise.all(espnQueryDates(date).map(fetchSourceDay));
+  const games = days.flatMap((data) => data.events.map((event) => mapEvent(event, date)))
+    .filter((game) => game.gameDate === date);
+  return [...new Map(games.map((game) => [game.id, game])).values()]
+    .sort((a, b) => a.date.localeCompare(b.date));
 }
 
-/** 拉取一段日期区间内的全部比赛（ESPN 支持 dates=YYYYMMDD-YYYYMMDD） */
-export async function fetchScoreboardRange(from: string, to: string): Promise<GameSummary[]> {
-  const url =
-    `${ESPN_SITE}/apis/site/v2/sports/basketball/nba/scoreboard` +
-    `?dates=${espnDateParam(from)}-${espnDateParam(to)}&limit=300&lang=en`;
-  const data = await getJson<{ events?: Json[] }>(url, 12000);
-  const events = data.events ?? [];
-  return events.map((event) => mapEvent(event, str(event.date)?.slice(0, 10) ?? to));
+type SourceDay = { events: Json[]; leagues?: Json[] };
+const sourceInflight = new Map<string, Promise<SourceDay>>();
+const scheduleDates = new Set<string>();
+const scheduleProbeAt = new Map<string, number>();
+
+function fetchSourceDay(date: string): Promise<SourceDay> {
+  const pending = sourceInflight.get(date);
+  if (pending) return pending;
+  const request = (async () => {
+    const url = `${ESPN_SITE}/apis/site/v2/sports/basketball/nba/scoreboard?dates=${espnDateParam(date)}&lang=en`;
+    const data = await getJson<SourceDay>(url);
+    if (!Array.isArray(data.events)) throw new Error("比分响应缺少比赛列表");
+    for (const league of data.leagues ?? []) {
+      if (league.calendarType !== "day" || !Array.isArray(league.calendar)) continue;
+      for (const entry of league.calendar) {
+        if (typeof entry !== "string") continue;
+        // calendar 是比赛日标记，不是比赛开赛时间；实际北京时间日期由事件筛选。
+        const day = entry.slice(0, 10);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+          scheduleDates.add(day);
+          scheduleDates.add(shiftDate(day, 1));
+        }
+      }
+    }
+    return data;
+  })();
+  sourceInflight.set(date, request);
+  request.finally(() => sourceInflight.delete(date)).catch(() => {});
+  return request;
+}
+
+/** 单日响应中的赛程日历；必要时补取上一赛季的索引，查询次数固定有界。 */
+export async function fetchRecentScheduleDates(today: string): Promise<string[]> {
+  const probeDate = shiftDate(today, -180);
+  if (Date.now() - (scheduleProbeAt.get(probeDate) ?? 0) >= 3600000) {
+    await fetchSourceDay(probeDate);
+    scheduleProbeAt.set(probeDate, Date.now());
+  }
+  return [...scheduleDates].filter((date) => date < today).sort().reverse();
 }
 
 function str(value: unknown): string | null {
@@ -98,7 +138,7 @@ function mapTeam(raw: Json): GameTeam {
     score: num(raw.score),
     record: records.length ? str(records[0].summary) : null,
     winner: Boolean(raw.winner),
-    logo: str(team.logo) ?? str(team.logos),
+    logo: str(team.logo) ?? str(((team.logos as Json[] | undefined) ?? [])[0]?.href),
     leaders: ((raw.leaders as Json[] | undefined) ?? []).map(mapLeader),
   };
 }
@@ -108,10 +148,13 @@ function mapEvent(event: Json, fallbackDate: string): GameSummary {
   const status = ((event.status as Json | undefined) ?? {}) as Json;
   const type = (status.type as Json | undefined) ?? {};
   const competitors = (comp.competitors as Json[] | undefined) ?? [];
-  const mapped = competitors.map(mapTeam);
-  const home = mapped.find((t) => (t as GameTeam & { homeAway?: string }).homeAway === "home") ?? mapped[0];
-  const away =
-    mapped.find((t) => (t as GameTeam & { homeAway?: string }).homeAway === "away") ?? mapped[1];
+  const homeRaw = competitors.find((c) => c.homeAway === "home");
+  const awayRaw = competitors.find((c) => c.homeAway === "away");
+  if (!str(event.id) || !dateInZone(str(event.date) ?? "") || !homeRaw || !awayRaw) {
+    throw new Error("比赛响应缺少编号、时间或主客队");
+  }
+  const home = mapTeam(homeRaw);
+  const away = mapTeam(awayRaw);
   const odds = (comp.odds as Json[] | undefined)?.[0] ?? null;
   const broadcasts = (comp.broadcasts as Json[] | undefined) ?? [];
   const broadcastNames = broadcasts
@@ -135,7 +178,7 @@ function mapEvent(event: Json, fallbackDate: string): GameSummary {
   return {
     id: str(event.id) ?? "",
     date: str(event.date) ?? "",
-    gameDate: fallbackDate,
+    gameDate: dateInZone(str(event.date) ?? "") || fallbackDate,
     shortName: str(event.shortName) ?? "",
     name: str(event.name) ?? "",
     statusState: (str(type.state) ?? "pre") as GameSummary["statusState"],
@@ -255,6 +298,7 @@ export async function fetchAthlete(espnId: string): Promise<Partial<PlayerProfil
     college: str((data.college as Json | undefined)?.name),
     experience: str(data.experience)?.replace(" years", " 年") ?? null,
     active: data.active !== false,
+    teamAbbr: ESPN_TEAM_ABBR[(str((data.team as Json | undefined)?.$ref) ?? "").match(/\/teams\/(\d+)/)?.[1] ?? ""] ?? null,
   };
 }
 
@@ -287,12 +331,15 @@ type AthleteOverview = {
 
 export async function fetchAthleteOverview(espnId: string, season?: number): Promise<AthleteOverview> {
   const year = season ?? currentNbaSeasonYear();
-  const url = `${ESPN_SITE}/apis/common/v3/sports/basketball/nba/athletes/${espnId}/overview?season=${year}`;
+  const url = `${ESPN_SITE}/apis/common/v3/sports/basketball/nba/athletes/${espnId}/overview?season=${espnSeasonYear(year)}`;
   const data = await getJson<Json>(url);
   const statistics = (data.statistics as Json | undefined) ?? {};
   const splits = (statistics.splits as Json[] | undefined) ?? [];
   const gameLog = (data.gameLog as Json | undefined) ?? {};
-  const events = (gameLog.events as Json[] | undefined) ?? [];
+  const eventMap = (gameLog.events as Json | undefined) ?? {};
+  const events: Json[] = Array.isArray(gameLog.events) ? gameLog.events as Json[] :
+    ((((gameLog.statistics as Json[] | undefined) ?? [])[0]?.events as Json[] | undefined) ?? [])
+      .map((entry) => ({ ...entry, event: eventMap[String(entry.eventId)] }));
   const rotowire = (data.rotowire as Json | undefined) ?? {};
   const awards = (data.awards as Json[] | undefined) ?? [];
 
@@ -376,7 +423,7 @@ export async function fetchEspnLeaders(options: {
   const url =
     `${ESPN_SITE}/apis/common/v3/sports/basketball/nba/statistics/byathlete` +
     `?region=us&lang=en&contentorigin=espn&isqualified=true&page=1&limit=${limit}` +
-    `&season=${seasonYear + 1}&seasontype=${seasonType}` +
+    `&season=${espnSeasonYear(seasonYear)}&seasontype=${seasonType}` +
     `&sort=${encodeURIComponent(`${sortKey}:desc`)}`;
   const data = await getJson<{
     categories?: { name?: string; names?: string[] }[];
@@ -501,8 +548,9 @@ async function fetchAthleteSeasonAverages(
   let data: { splits?: { categories?: { name?: string; stats?: { name?: string; value?: number }[] }[] } };
   try {
     data = await getJson(url);
-  } catch {
-    return null; // 404 = 该季该阶段未参赛
+  } catch (error) {
+    if (error instanceof UpstreamError && error.status === 404) return null;
+    throw error; // 超时/服务错误不能解释成“未参赛”。
   }
   const map = new Map<string, number>();
   for (const cat of data.splits?.categories ?? []) {
@@ -533,6 +581,104 @@ async function fetchAthleteSeasonAverages(
   };
 }
 
+/** 应用统一使用赛季起始年，所有 ESPN 球员接口统一转换为结束年。 */
+export function espnSeasonYear(startYear: number): number {
+  return startYear + 1;
+}
+
+/** 不依赖 statisticslog 是否已更新，始终直接探测当季常规赛汇总。 */
+export async function fetchAthleteCurrentSeason(espnId: string, startYear: number, phase: 2 | 3 = 2): Promise<PlayerSeasonStat | null> {
+  const averages = await fetchAthleteSeasonAverages(espnId, espnSeasonYear(startYear), phase);
+  if (!averages || (averages.gp ?? 0) <= 0) return null;
+  return { ...averages, seasonYear: startYear, seasonLabel: seasonLabel(startYear), seasonType: phase === 2 ? "regular" : "playoffs",
+    teamAbbr: null, source: "live", provenance: "official" };
+}
+
+/**
+ * 新赛季汇总通常晚于逐场记录发布。严格选择指定赛季的常规赛，按字段名读取，
+ * 去除 DNP、重复赛事、季前赛；命中率由总命中/总出手计算，不平均各场百分比。
+ */
+type AthleteSeasonGameLog = {
+  season: PlayerSeasonStat | null;
+  recentGames: PlayerGameLogEntry[];
+};
+
+export async function fetchAthleteSeasonGameLog(espnId: string, startYear: number): Promise<AthleteSeasonGameLog & {
+  playoffs: PlayerSeasonStat | null;
+}> {
+  const year = espnSeasonYear(startYear);
+  const data = await getJson<Json>(`${ESPN_SITE}/apis/common/v3/sports/basketball/nba/athletes/${espnId}/gamelog?season=${year}&seasontype=2&lang=en`);
+  const regular = parseAthleteSeasonGameLog(data, startYear, 2);
+  const playoffs = parseAthleteSeasonGameLog(data, startYear, 3);
+  return { ...regular, playoffs: playoffs.season, recentGames: [...regular.recentGames, ...playoffs.recentGames]
+    .sort((a, b) => b.date.localeCompare(a.date)).slice(0, 10) };
+}
+
+function parseAthleteSeasonGameLog(data: Json, startYear: number, phase: 2 | 3): AthleteSeasonGameLog {
+  const year = espnSeasonYear(startYear);
+  const filters = (data.filters as Json[] | undefined) ?? [];
+  const actualYear = num(filters.find((filter) => filter.name === "season")?.value);
+  if (actualYear === null || !Array.isArray(data.seasonTypes) || !Array.isArray(data.names)) {
+    throw new Error("球员逐场记录缺少有效的赛季信息");
+  }
+  // 未参赛/退役球员可能被上游自动回退到旧季；旧季不能冒充请求的新赛季。
+  if (actualYear !== year) return { season: null, recentGames: [] };
+  const names = data.names as string[];
+  const eventMap = (data.events as Json | undefined) ?? {};
+  const unique = new Map<string, { stats: string[]; event: Json }>();
+  for (const group of data.seasonTypes as Json[]) {
+    const label = str(group.displayName) ?? "";
+    const phaseLabel = phase === 2 ? /Regular Season$/i : /(?:Postseason|Playoffs)$/i;
+    if (!label.startsWith(seasonLabel(startYear)) || !phaseLabel.test(label)) continue;
+    for (const category of (group.categories as Json[] | undefined) ?? []) {
+      for (const row of (category.events as Json[] | undefined) ?? []) {
+        const id = str(row.eventId);
+        const event = id ? eventMap[id] as Json | undefined : undefined;
+        const stats = (row.stats as string[] | undefined) ?? [];
+        if (!id || !event || !["W", "L"].includes(str(event.gameResult) ?? "")) continue;
+        const date = dateInZone(str(event.gameDate) ?? "");
+        if (!date || date < `${startYear}-08-01` || date >= `${startYear + 1}-08-01`) continue;
+        if (parseMinutes(stats[names.indexOf("minutes")] ?? null) === null ||
+            num(stats[names.indexOf("points")]) === null) continue;
+        unique.set(id, { stats, event });
+      }
+    }
+  }
+  const rows = [...unique.values()].sort((a, b) => String(b.event.gameDate).localeCompare(String(a.event.gameDate)));
+  const at = (row: { stats: string[] }, name: string) => row.stats[names.indexOf(name)] ?? null;
+  const recentGames = rows.slice(0, 10).map((row): PlayerGameLogEntry => ({
+    date: dateInZone(str(row.event.gameDate) ?? ""),
+    opponent: str((row.event.opponent as Json | undefined)?.abbreviation) ?? "",
+    homeAway: row.event.atVs === "@" ? "away" : "home",
+    result: `${str(row.event.gameResult) ?? ""} ${str(row.event.score) ?? ""}`.trim(),
+    minutes: at(row, "minutes"), pts: at(row, "points"), reb: at(row, "totalRebounds"), ast: at(row, "assists"),
+    fg: at(row, "fieldGoalPct") === null ? null : `${at(row, "fieldGoalPct")}%`, detail: phase === 2 ? "Regular Season" : "Postseason",
+  }));
+  if (!rows.length) return { season: null, recentGames };
+  const average = (name: string, minutes = false) => {
+    const values = rows.map((row) => minutes ? parseMinutes(at(row, name)) : num(at(row, name)));
+    return values.some((value) => value === null) ? null :
+      Math.round(values.reduce<number>((sum, value) => sum + (value ?? 0), 0) / rows.length * 10) / 10;
+  };
+  const percentage = (name: string) => {
+    let made = 0, attempted = 0;
+    for (const row of rows) {
+      const match = at(row, name)?.match(/^(\d+)-(\d+)$/);
+      if (!match || Number(match[1]) > Number(match[2])) return null;
+      made += Number(match[1]); attempted += Number(match[2]);
+    }
+    return attempted ? made / attempted : 0;
+  };
+  return { recentGames, season: {
+    seasonYear: startYear, seasonLabel: seasonLabel(startYear), seasonType: phase === 2 ? "regular" : "playoffs",
+    teamAbbr: str((rows[0].event.team as Json | undefined)?.abbreviation), source: "live", provenance: "game-log",
+    gp: rows.length, min: average("minutes", true), pts: average("points"), reb: average("totalRebounds"),
+    ast: average("assists"), stl: average("steals"), blk: average("blocks"), tov: average("turnovers"),
+    fgp: percentage("fieldGoalsMade-fieldGoalsAttempted"), tpp: percentage("threePointFieldGoalsMade-threePointFieldGoalsAttempted"),
+    ftp: percentage("freeThrowsMade-freeThrowsAttempted"),
+  } };
+}
+
 async function mapLimitLocal<T, R>(
   items: T[],
   limit: number,
@@ -541,10 +687,8 @@ async function mapLimitLocal<T, R>(
   const results: R[] = [];
   for (let i = 0; i < items.length; i += limit) {
     const chunk = items.slice(i, i + limit);
-    const settled = await Promise.allSettled(chunk.map(fn));
-    for (const s of settled) {
-      if (s.status === "fulfilled") results.push(s.value);
-    }
+    // 不把网络失败的半份生涯数据当作完整成功结果写入长期缓存。
+    results.push(...await Promise.all(chunk.map(fn)));
   }
   return results;
 }
@@ -609,8 +753,7 @@ export async function fetchEspnPlayerSeasonHistory(
 
 /** ESPN 赛季标签：2026 年秋开始的赛季记作 2026-27 */
 export function currentNbaSeasonYear(now = new Date()): number {
-  const year = now.getUTCFullYear();
-  const month = now.getUTCMonth() + 1;
+  const [year, month] = dateInZone(now).split("-").map(Number);
   return month >= 8 ? year : year - 1;
 }
 
@@ -648,6 +791,14 @@ const TEAM_STAT_SPECS: {
   { key: "largestLead", label: "最大领先" },
 ];
 
+function parseMinutes(value: string | null): number | null {
+  if (value && /^\d+:\d{2}$/.test(value)) {
+    const [minutes, seconds] = value.split(":").map(Number);
+    return seconds < 60 ? Math.round((minutes + seconds / 60) * 100) / 100 : null;
+  }
+  return num(value);
+}
+
 function mapBoxscorePlayers(teamBlock: Json): BoxscorePlayer[] {
   const statGroup = ((teamBlock.statistics as Json[] | undefined) ?? [])[0];
   const labels = (statGroup?.labels as string[] | undefined) ?? [];
@@ -668,7 +819,7 @@ function mapBoxscorePlayers(teamBlock: Json): BoxscorePlayer[] {
       starter: Boolean(entry.starter),
       didNotPlay: Boolean(entry.didNotPlay),
       reason: str(entry.reason),
-      minutes: num(at(stats, "MIN")),
+      minutes: parseMinutes(at(stats, "MIN")),
       pts: num(at(stats, "PTS")),
       reb: num(at(stats, "REB")),
       ast: num(at(stats, "AST")),
@@ -695,6 +846,10 @@ export async function fetchGameSummary(gameId: string): Promise<GameDetail> {
   const comp = ((header.competitions as Json[] | undefined) ?? [])[0] ?? {};
   const statusType = ((comp.status as Json | undefined)?.type as Json | undefined) ?? {};
   const competitors = (comp.competitors as Json[] | undefined) ?? [];
+  if (str(header.id) !== gameId || !competitors.some((c) => c.homeAway === "home") ||
+      !competitors.some((c) => c.homeAway === "away") || !dateInZone(str(comp.date) ?? "")) {
+    throw new Error("比赛详情响应不完整");
+  }
   const awayRaw = competitors.find((c) => str(c.homeAway) === "away") ?? competitors[0] ?? {};
   const homeRaw = competitors.find((c) => str(c.homeAway) === "home") ?? competitors[1] ?? {};
 
@@ -778,7 +933,7 @@ export async function fetchGameSummary(gameId: string): Promise<GameDetail> {
   const gameInfo = (data.gameInfo as Json | undefined) ?? {};
   return {
     id: str(header.id) ?? gameId,
-    gameDate: (str(comp.date) ?? "").slice(0, 10),
+    gameDate: dateInZone(str(comp.date) ?? ""),
     statusState: (str(statusType.state) ?? "pre") as GameDetail["statusState"],
     statusDetail: str(statusType.detail) ?? str(statusType.description) ?? "",
     completed: Boolean(statusType.completed),

@@ -1,13 +1,18 @@
 "use client";
 
 import { useSearchParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useCallback } from "react";
 import GameCard from "@/components/GameCard";
 import DateNavigator from "@/components/DateNavigator";
-import { formatDateZh, normalizeDate, todayIso } from "@/lib/nba/dates";
+import { formatDateZh, normalizeDate, timeZh, todayIso } from "@/lib/nba/dates";
+import { scoreboardRefreshMs } from "@/lib/nba/freshness";
+import { useLiveResult } from "@/lib/nba/useLiveResult";
 import { getRecentBoard, getScoreboard } from "@/lib/nba/store";
 import { teamZh } from "@/lib/nba/teams";
 import type { ScoreboardResult } from "@/lib/nba/types";
+
+// 默认首页即使正在展示历史比赛，也要继续检查今天是否已有比赛。
+const recentRefreshMs = (result: ScoreboardResult) => scoreboardRefreshMs(result) ?? 60000;
 
 /**
  * 比分中心（纯前端版）：日期取自 URL ?date=YYYY-MM-DD，
@@ -17,21 +22,11 @@ export default function ScoresBoard() {
   const params = useSearchParams();
   const requested = params.get("date");
   const date = normalizeDate(requested ?? todayIso());
-  const [board, setBoard] = useState<ScoreboardResult | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    setBoard(null);
-    (async () => {
-      const result = requested
-        ? await getScoreboard(date).catch(() => null)
-        : await getRecentBoard().catch(() => null);
-      if (alive) setBoard(result);
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [requested, date]);
+  const load = useCallback((force: boolean): Promise<ScoreboardResult> => (
+    requested ? getScoreboard(date, { force }) : getRecentBoard({ force })
+  ), [requested, date]);
+  const { result: board, refreshing, refresh } = useLiveResult(`${requested ?? "recent"}:${date}`, load, requested ? scoreboardRefreshMs : recentRefreshMs);
+  const displayDate = board?.date ?? date;
 
   const games = board?.games ?? [];
   const finished = games.filter((g) => g.statusState === "post");
@@ -43,7 +38,7 @@ export default function ScoresBoard() {
       <header className="space-y-2">
         <h1 className="text-2xl font-black text-white">🏀 比分中心</h1>
         <p className="text-sm text-slate-400">
-          {formatDateZh(date)} · 数据源{" "}
+          {formatDateZh(displayDate)} · 北京时间 · 数据源{" "}
           {!board
             ? "加载中…"
             : board.source === "live"
@@ -53,19 +48,32 @@ export default function ScoresBoard() {
                 : "离线"}
           {board && games.length > 0
             ? ` · 直播 ${live.length} 场 / 已结束 ${finished.length} 场 / 未开赛 ${upcoming.length} 场`
-            : board
+            : board && !board.error
               ? " · 本日暂无比赛安排"
               : ""}
         </p>
+        {board?.fetchedAt ? <p className="text-xs text-slate-500">上次更新：{timeZh(board.fetchedAt)}{live.length ? " · 直播每 30 秒更新" : ""}</p> : null}
+        {board && board.date !== date ? <p className="text-xs text-slate-400">今天暂无比赛，已展示最近比赛日。</p> : null}
       </header>
 
-      <DateNavigator date={date} />
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="min-w-0 flex-1"><DateNavigator date={displayDate} /></div>
+        <button type="button" onClick={refresh} disabled={refreshing} className="btn btn-ghost !text-xs">
+          {refreshing ? "刷新中…" : "立即刷新"}
+        </button>
+      </div>
+
+      {board?.error ? (
+        <div role="alert" className="panel p-4 text-sm text-amber-300">
+          {board.error}{board.stale ? " 当前展示上次成功获取的缓存数据。" : ""}
+        </div>
+      ) : null}
 
       {!board ? (
         <div className="panel p-8 text-center text-sm text-slate-400">正在抓取比分数据…</div>
       ) : games.length === 0 ? (
         <div className="panel p-8 text-center">
-          <p className="text-sm text-slate-300">这一天没有 NBA 比赛（可能是休赛期或空档日）。</p>
+          <p className="text-sm text-slate-300">{board.error ? "暂时无法确认当日赛程，请点击“立即刷新”重试。" : "这一天没有 NBA 比赛（可能是休赛期或空档日）。"}</p>
           <p className="mt-2 text-xs text-slate-500">
             提示：NBA 常规赛通常在 10 月中旬至次年 4 月进行，可切换日期查看历史比分。
           </p>
@@ -91,7 +99,7 @@ export default function ScoresBoard() {
               const top = winner.leaders.find((l) => l.name === "points");
               return (
                 <li key={`${game.id}-line`} className="panel-soft px-3 py-2">
-                  {game.statusState === "post" ? (
+                  {game.statusState === "post" && game.home.score !== null && game.away.score !== null ? (
                     <>
                       <span className="font-semibold text-orange-200">{teamZh(winner.abbr)}</span>{" "}
                       {margin} 分战胜 {teamZh(loser.abbr)}（{away}-{home} 客主比分）

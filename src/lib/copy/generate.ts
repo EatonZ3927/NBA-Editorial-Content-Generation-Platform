@@ -1,3 +1,4 @@
+import { todayIso } from "@/lib/nba/dates";
 import { getLeagueLeaders, getNews, getPlayerProfile, getScoreboard } from "@/lib/nba/store";
 import { currentNbaSeasonYear } from "@/lib/nba/espn";
 import { generateCopy, type CopyContext, type CopyResult, type LengthId, type TemplateId, type ToneId } from "./engine";
@@ -40,7 +41,7 @@ export async function buildContext(input: GenerateInput): Promise<CopyContext> {
   }
 
   if (input.gameId) {
-    const date = input.gameDate ?? new Date().toISOString().slice(0, 10);
+    const date = input.gameDate ?? todayIso();
     tasks.push(
       getScoreboard(date)
         .then((board) => {

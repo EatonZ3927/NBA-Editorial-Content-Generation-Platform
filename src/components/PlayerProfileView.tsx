@@ -1,8 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback } from "react";
 import { getPlayerProfile } from "@/lib/nba/store";
+import { seasonLabel } from "@/lib/nba/espn";
+import { timeZh } from "@/lib/nba/dates";
+import { useLiveResult } from "@/lib/nba/useLiveResult";
 import type { PlayerProfile, PlayerSeasonStat, StatSplit } from "@/lib/nba/types";
 
 function n1(v: number | null | undefined) {
@@ -12,31 +15,18 @@ function pct(v: number | null | undefined) {
   return v === null || v === undefined || !Number.isFinite(v) ? "—" : `${(v * 100).toFixed(1)}%`;
 }
 
+const playerRefreshMs = (player: PlayerProfile) => player.error ? 30000 :
+  !player.active ? null : player.currentSeasonStatus === "pending" ? 60000 : 5 * 60000;
+
 /**
  * 球员详情（纯前端版）：档案与生涯数据由本浏览器直连 ESPN 抓取，
- * 结果缓存到本机 localStorage（30 分钟）。
+ * 当季统计每 5 分钟更新，尚未发布时每分钟重查；支持强制刷新。
  */
 export default function PlayerProfileView({ espnId }: { espnId: string }) {
-  const [player, setPlayer] = useState<PlayerProfile | null>(null);
-  const [loading, setLoading] = useState(true);
+  const load = useCallback((force: boolean) => getPlayerProfile(espnId, { force }), [espnId]);
+  const { result: player, refreshing, refresh } = useLiveResult(espnId, load, playerRefreshMs);
 
-  useEffect(() => {
-    let alive = true;
-    setLoading(true);
-    setPlayer(null);
-    getPlayerProfile(espnId)
-      .catch(() => null)
-      .then((p) => {
-        if (!alive) return;
-        setPlayer(p);
-        setLoading(false);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [espnId]);
-
-  if (loading) {
+  if (!player) {
     return (
       <div className="panel flex items-center justify-center gap-3 p-12 text-sm text-slate-400">
         <span className="h-5 w-5 animate-spin rounded-full border-2 border-orange-400 border-t-transparent" />
@@ -49,7 +39,8 @@ export default function PlayerProfileView({ espnId }: { espnId: string }) {
   if (bogus) {
     return (
       <div className="panel p-10 text-center">
-        <p className="text-sm text-slate-300">未找到该球员的数据。</p>
+        <p className="text-sm text-slate-300">{player?.error ?? "未找到该球员的数据。"}</p>
+        <button type="button" onClick={refresh} disabled={refreshing} className="btn btn-ghost mt-3 !text-xs">{refreshing ? "刷新中…" : "重新获取"}</button>
         <p className="mt-2 text-xs text-slate-500">
           可能是 ESPN ID 无效或数据源暂时不可用，请返回{" "}
           <Link href="/players" className="text-orange-300 hover:text-orange-200">
@@ -80,7 +71,15 @@ export default function PlayerProfileView({ espnId }: { espnId: string }) {
         </Link>
         <span>/</span>
         <span className="text-slate-300">{player.fullName}</span>
+        <button type="button" onClick={refresh} disabled={refreshing} className="btn btn-ghost ml-auto !text-xs">{refreshing ? "刷新中…" : "立即刷新"}</button>
       </div>
+
+      {player.error ? <div role="alert" className="panel p-4 text-sm text-amber-300">{player.error}</div> : null}
+      {player.currentSeasonStatus === "game-log" ? (
+        <div className="panel p-4 text-sm text-slate-400">{seasonLabel(player.requestedSeasonYear)} 常规赛：按当季已发布的逐场记录计算，未混入季前赛；官方赛季汇总更新后自动切换。</div>
+      ) : player.active && player.currentSeasonStatus === "pending" ? (
+        <div className="panel p-4 text-sm text-slate-400">{seasonLabel(player.requestedSeasonYear)} 暂无已发布的常规赛统计（可能尚未出场或上游仍在更新），将自动重查。{player.currentSeasonYear !== null ? `下方展示的最近赛季为 ${seasonLabel(player.currentSeasonYear)}。` : ""}</div>
+      ) : null}
 
       {/* 档案 */}
       <section className="panel flex flex-col gap-5 p-5 sm:flex-row sm:items-center">
@@ -125,7 +124,7 @@ export default function PlayerProfileView({ espnId }: { espnId: string }) {
 
       {/* 数据卡 */}
       <section className="grid gap-4 lg:grid-cols-3">
-        <SplitCard title="最近赛季" split={player.currentSeason} accent />
+        <SplitCard title={player.currentSeasonYear !== null ? `${seasonLabel(player.currentSeasonYear)} 常规赛` : `${seasonLabel(player.requestedSeasonYear)} 常规赛`} split={player.currentSeason} accent />
         <SplitCard title="生涯常规赛" split={player.careerRegular} />
         <SplitCard title="生涯季后赛" split={player.careerPlayoffs} />
       </section>
@@ -208,7 +207,7 @@ export default function PlayerProfileView({ espnId }: { espnId: string }) {
                 {player.careerPlayoffs?.gp ? `、${player.careerPlayoffs.gp} 场季后赛` : ""}数据。
               </p>
               <p className="mt-1">
-                抓取时间 {new Date(player.fetchedAt).toLocaleString("zh-CN")} · ESPN ID {player.espnId}
+                抓取时间 {timeZh(player.fetchedAt)} · ESPN ID {player.espnId}
               </p>
             </div>
           </div>

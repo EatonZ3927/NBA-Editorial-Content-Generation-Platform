@@ -3,10 +3,10 @@
  *
  * 所有 NBA 数据直接从 ESPN 公开接口抓取（已验证 CORS 全部开放），
  * 缓存落在当前浏览器的 localStorage，无需任何后端 / 数据库：
- * - 比分：按日期缓存；历史日期长缓存（结果不变），当天/进行中短缓存
+ * - 比分：按北京时间日期缓存；按比赛状态分级，近期完赛与不完整统计保持短缓存
  * - 新闻：12 小时自动刷新（北京时间 00:00 / 12:00 边界槽位）、10 天有效期、
  *   完全重复筛查（标题+描述归一化）；手动刷新只更新当前页面预览，不写本地库
- * - 数据榜 / 球员档案与生涯数据：30 分钟缓存
+ * - 数据榜：30 分钟缓存；球员当季：5 分钟；历史赛季：24 小时，按赛季自动滚动
  * - 草稿箱：localStorage 持久化（每个浏览器各自一份）
  */
 
@@ -14,15 +14,19 @@ import {
   currentNbaSeasonYear,
   fetchAthlete,
   fetchAthleteOverview,
+  fetchAthleteCurrentSeason,
+  fetchAthleteSeasonGameLog,
   fetchEspnLeaders,
   fetchEspnPlayerSeasonHistory,
   fetchGameSummary,
   fetchNews,
   fetchScoreboard,
-  fetchScoreboardRange,
+  fetchRecentScheduleDates,
   searchAthletes,
   seasonLabel,
 } from "./espn";
+import { normalizeDate, shiftDate, todayIso } from "./dates";
+import { gameDetailTtl, isGameDetailIncomplete, scoreboardTtl } from "./freshness";
 import { PLAYER_ZH as playerZhMap, STAR_PICKS, playerZh, teamZh } from "./teams";
 import type {
   DataSource,
@@ -80,60 +84,71 @@ function nowIso(): string {
 
 /* ------------------------------ 比分 ------------------------------ */
 
-const GAMES_TTL_LIVE_MS = 3 * 60 * 1000; // 当天/未来：3 分钟
-const GAMES_TTL_PAST_MS = 7 * 24 * 3600 * 1000; // 历史日期：7 天（结果不会再变）
+export type RefreshOptions = { force?: boolean };
 
-export async function getScoreboard(date: string): Promise<ScoreboardResult> {
-  const today = new Date().toISOString().slice(0, 10);
-  const ttl = date < today ? GAMES_TTL_PAST_MS : GAMES_TTL_LIVE_MS;
-  const key = `nba:games:${date}`;
-
-  const fresh = cacheGet<GameSummary[]>(key, ttl);
-  if (fresh && fresh.length > 0) {
-    return { date, source: "cache", games: fresh, fetchedAt: nowIso() };
-  }
+function readCacheBox<T>(key: string): CacheBox<T> | null {
   try {
-    const games = await fetchScoreboard(date);
-    if (games.length > 0) {
-      cacheSet(key, games);
-      return { date, source: "live", games, fetchedAt: nowIso() };
-    }
-  } catch {
-    // 落入下方缓存兜底
-  }
-  const stale = cacheGetStale<GameSummary[]>(key) ?? [];
-  return { date, source: stale.length ? "cache" : "offline", games: stale, fetchedAt: nowIso() };
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return null;
+    const box = JSON.parse(raw) as CacheBox<T>;
+    return Number.isFinite(box.at) && box.at <= Date.now() && box.value != null ? box : null;
+  } catch { return null; }
 }
 
-/**
- * 最近一个有比赛的日期：先看今天，没有则一次性拉取过去 160 天的区间数据，
- * 取最新比赛日（自动跨过休赛期/空档日）。
- */
-export async function getRecentBoard(): Promise<ScoreboardResult> {
-  const today = new Date().toISOString().slice(0, 10);
-  const todayBoard = await getScoreboard(today);
-  if (todayBoard.games.length > 0) return todayBoard;
+const scoreboardInflight = new Map<string, Promise<ScoreboardResult>>();
 
-  const pointerKey = "nba:games:latest-date";
-  const pointer = cacheGet<string>(pointerKey, 3600 * 1000);
-  if (pointer && pointer !== today) return getScoreboard(pointer);
+export async function getScoreboard(input: string, options: RefreshOptions = {}): Promise<ScoreboardResult> {
+  const date = normalizeDate(input);
+  // 新版本只读北京时间缓存，旧日期口径的缓存自然失效，不影响草稿等数据。
+  const key = `nba:games:v2:beijing:${date}`;
+  const cached = readCacheBox<GameSummary[]>(key);
+  if (!options.force && cached && Date.now() - cached.at < scoreboardTtl(cached.value, date)) {
+    return { date, source: "cache", games: cached.value, fetchedAt: new Date(cached.at).toISOString() };
+  }
+  const pending = scoreboardInflight.get(date);
+  if (pending) return pending;
+  const request = (async (): Promise<ScoreboardResult> => {
+    try {
+      const games = await fetchScoreboard(date);
+      cacheSet(key, games); // 成功的空结果同样是有效数据。
+      return { date, source: "live", games, fetchedAt: nowIso() };
+    } catch {
+      return {
+        date, source: cached ? "cache" : "offline", games: cached?.value ?? [],
+        fetchedAt: cached ? new Date(cached.at).toISOString() : null,
+        stale: Boolean(cached), error: "比分数据获取失败，请稍后重试。",
+      };
+    }
+  })();
+  scoreboardInflight.set(date, request);
+  request.finally(() => scoreboardInflight.delete(date)).catch(() => {});
+  return request;
+}
 
-  const from = new Date(`${today}T12:00:00Z`);
-  from.setUTCDate(from.getUTCDate() - 160);
+/** 先逐日回查最近三天，再利用赛程日历定位；不使用不受支持的区间查询。 */
+export async function getRecentBoard(options: RefreshOptions = {}): Promise<ScoreboardResult> {
+  const today = todayIso();
+  const todayBoard = await getScoreboard(today, options);
+  if (todayBoard.games.length || todayBoard.error) return todayBoard;
+  const checked = new Set([today]);
+  const tryDay = async (date: string) => {
+    checked.add(date);
+    const result = await getScoreboard(date, options);
+    return result.games.length || result.error ? result : null;
+  };
+  for (let offset = 1; offset <= 3; offset++) {
+    const result = await tryDay(shiftDate(today, -offset));
+    if (result) return result;
+  }
   try {
-    const range = await fetchScoreboardRange(from.toISOString().slice(0, 10), today);
-    if (range.length > 0) {
-      const latestDate = range.reduce((max, g) => (g.gameDate > max ? g.gameDate : max), range[0].gameDate);
-      const latest = range.filter((g) => g.gameDate === latestDate);
-      cacheSet(`nba:games:${latestDate}`, latest);
-      cacheSet(pointerKey, latestDate);
-      return { date: latestDate, source: "live", games: latest, fetchedAt: nowIso() };
+    const candidates = (await fetchRecentScheduleDates(today)).filter((date) => !checked.has(date)).slice(0, 4);
+    for (const date of candidates) {
+      const result = await tryDay(date);
+      if (result) return result;
     }
   } catch {
-    // 落入下方兜底
+    return { ...todayBoard, error: "当日无比赛，但最近赛程查询失败，请重试或手动选择日期。" };
   }
-  const stalePointer = cacheGetStale<string>(pointerKey);
-  if (stalePointer && stalePointer !== today) return getScoreboard(stalePointer);
   return todayBoard;
 }
 
@@ -360,7 +375,9 @@ export async function searchPlayers(query: string): Promise<PlayerSearchHit[]> {
 
 /* ------------------------------ 球员档案 ------------------------------ */
 
-const PROFILE_TTL_MS = 30 * 60 * 1000;
+const PROFILE_TTL_MS = 5 * 60 * 1000;
+const PROFILE_HISTORY_TTL_MS = 24 * 3600 * 1000;
+const profileInflight = new Map<string, Promise<PlayerProfile>>();
 
 function emptySplit(): StatSplit {
   return { label: "", gp: null, min: null, pts: null, reb: null, ast: null, stl: null, blk: null, fgp: null, tpp: null, ftp: null };
@@ -389,112 +406,118 @@ function aggregate(seasons: PlayerSeasonStat[]): StatSplit {
   };
 }
 
-/** overview 接口的命中率是百分制（46.8），统一压成 0-1 小数 */
-function normalizeSplitPct(s: StatSplit): StatSplit {
-  const fix = (v: number | null) => (v !== null && v > 1.5 ? v / 100 : v);
-  return { ...s, fgp: fix(s.fgp), tpp: fix(s.tpp), ftp: fix(s.ftp) };
+/** 赛季键每年自动滚动；当季短缓存，历史赛季独立长缓存。 */
+export async function getPlayerProfile(espnId: string, options: RefreshOptions = {}): Promise<PlayerProfile> {
+  const year = currentNbaSeasonYear();
+  const cacheKey = `nba:player:v2:${year}:${espnId}`;
+  const box = readCacheBox<PlayerProfile>(cacheKey);
+  const stale = box?.value ?? null;
+  const ttl = stale?.active === false ? 30 * 60000 : stale?.currentSeasonStatus === "pending" ? 60000 : PROFILE_TTL_MS;
+  const cached = !options.force && box && Date.now() - box.at < ttl ? box.value : null;
+  if (cached) return { ...cached, source: "cache" };
+  const pending = profileInflight.get(cacheKey);
+  if (pending) return pending;
+  const request = loadPlayerProfile(espnId, year, cacheKey, stale, options);
+  profileInflight.set(cacheKey, request);
+  request.finally(() => profileInflight.delete(cacheKey)).catch(() => {});
+  return request;
 }
 
-export async function getPlayerProfile(espnId: string): Promise<PlayerProfile> {
-  const cacheKey = `nba:player:${espnId}`;
-  const cached = cacheGet<PlayerProfile>(cacheKey, PROFILE_TTL_MS);
-  if (cached) return cached;
-  const stale = cacheGetStale<PlayerProfile>(cacheKey);
-
+async function loadPlayerProfile(
+  espnId: string, year: number, cacheKey: string, stale: PlayerProfile | null, options: RefreshOptions,
+): Promise<PlayerProfile> {
   try {
-    const [athlete, overview] = await Promise.all([
+    const [athlete, overview, officialResult, logResult, playoffResult] = await Promise.all([
       fetchAthlete(espnId),
-      fetchAthleteOverview(espnId).catch(() => null),
+      fetchAthleteOverview(espnId, year).catch(() => null),
+      fetchAthleteCurrentSeason(espnId, year).then(
+        (value) => ({ value, failed: false }), () => ({ value: null, failed: true }),
+      ),
+      fetchAthleteSeasonGameLog(espnId, year).then(
+        (value) => ({ value, failed: false }), () => ({ value: null, failed: true }),
+      ),
+      fetchAthleteCurrentSeason(espnId, year, 3).then(
+        (value) => ({ value, failed: false }), () => ({ value: null, failed: true }),
+      ),
     ]);
     const fullName = athlete.fullName ?? stale?.fullName ?? "";
-    const from = athlete.debutYear ?? new Date().getUTCFullYear() - 6;
-    const seasons = await fetchEspnPlayerSeasonHistory(espnId, from, currentNbaSeasonYear()).catch(
-      () => stale?.seasons ?? [],
-    );
-
-    const latestRegular = seasons.find((s) => s.seasonType === "regular");
-    const teamAbbr = latestRegular?.teamAbbr ?? stale?.teamAbbr ?? null;
-
-    const overviewRegular = overview?.seasonSplits.find((s) => s.label === "Regular Season" && (s.gp ?? 0) > 0) ?? null;
-    const currentSeason: StatSplit | null = overviewRegular
-      ? normalizeSplitPct(overviewRegular)
-      : latestRegular
-        ? {
-            label: latestRegular.seasonLabel,
-            gp: latestRegular.gp,
-            min: latestRegular.min,
-            pts: latestRegular.pts,
-            reb: latestRegular.reb,
-            ast: latestRegular.ast,
-            stl: latestRegular.stl,
-            blk: latestRegular.blk,
-            fgp: latestRegular.fgp,
-            tpp: latestRegular.tpp,
-            ftp: latestRegular.ftp,
-          }
-        : null;
-    const regularSeasons = seasons.filter((s) => s.seasonType === "regular");
-    const playoffSeasons = seasons.filter((s) => s.seasonType === "playoffs");
-
+    const historyKey = `nba:player-history:v2:${year}:${espnId}`;
+    let history = options.force ? null : cacheGet<PlayerSeasonStat[]>(historyKey, PROFILE_HISTORY_TTL_MS);
+    let historyFailed = false;
+    if (!history) {
+      try {
+        history = await fetchEspnPlayerSeasonHistory(espnId, athlete.debutYear ?? 1979, year - 1);
+        cacheSet(historyKey, history);
+      } catch {
+        historyFailed = true;
+        history = cacheGetStale<PlayerSeasonStat[]>(historyKey) ?? stale?.seasons.filter((row) => row.seasonYear < year) ?? [];
+      }
+    }
+    const official = officialResult.value;
+    const fromLog = logResult.value?.season ?? null;
+    // 汇总已发布但场次落后时继续使用更完整的逐场记录；相同场次优先官方汇总。
+    let current = official && (!fromLog || (official.gp ?? 0) >= (fromLog.gp ?? 0)) ? official : fromLog;
+    const playoffLog = logResult.value?.playoffs ?? null;
+    let currentPlayoffs = playoffResult.value && (!playoffLog || (playoffResult.value.gp ?? 0) >= (playoffLog.gp ?? 0)) ? playoffResult.value : playoffLog;
+    const errors: string[] = [];
+    if (!current && (officialResult.failed || logResult.failed)) errors.push("当季统计获取失败，请稍后重试。");
+    if (!current) {
+      const saved = stale?.seasons.find((row) => row.seasonYear === year && row.seasonType === "regular");
+      if (saved) {
+        current = { ...saved, source: "cache" };
+        errors.push("上游当季统计暂未更新，保留上次成功抓取的数据。");
+      }
+    }
+    if (historyFailed) errors.push("历史赛季获取不完整，已保留可用缓存。");
+    if (!currentPlayoffs) {
+      const saved = stale?.seasons.find((row) => row.seasonYear === year && row.seasonType === "playoffs");
+      if (saved) {
+        currentPlayoffs = { ...saved, source: "cache" };
+        errors.push("当季季后赛统计暂未更新，已保留缓存。");
+      }
+    }
+    const teamAbbr = athlete.teamAbbr ?? current?.teamAbbr ?? stale?.teamAbbr ?? history[0]?.teamAbbr ?? null;
+    const seasons = [...history, ...[current, currentPlayoffs].filter((row): row is PlayerSeasonStat => row !== null)
+      .map((row) => ({ ...row, teamAbbr: row.teamAbbr ?? teamAbbr }))]
+      .sort((a, b) => b.seasonYear - a.seasonYear || (a.seasonType === "regular" ? -1 : 1));
+    const latestRegular = seasons.find((row) => row.seasonType === "regular");
+    const currentSeason: StatSplit | null = latestRegular ? {
+      label: latestRegular.seasonLabel, gp: latestRegular.gp, min: latestRegular.min,
+      pts: latestRegular.pts, reb: latestRegular.reb, ast: latestRegular.ast, stl: latestRegular.stl,
+      blk: latestRegular.blk, fgp: latestRegular.fgp, tpp: latestRegular.tpp, ftp: latestRegular.ftp,
+    } : null;
+    const regularSeasons = seasons.filter((row) => row.seasonType === "regular");
+    const playoffSeasons = seasons.filter((row) => row.seasonType === "playoffs");
     const profile: PlayerProfile = {
-      espnId,
-      fullName,
-      shortName: athlete.shortName ?? null,
-      zhName: playerZh(fullName),
-      teamAbbr,
-      teamName: stale?.teamName ?? null,
-      teamZh: teamZh(teamAbbr) || null,
+      espnId, fullName, shortName: athlete.shortName ?? null, zhName: playerZh(fullName),
+      teamAbbr, teamName: stale?.teamName ?? null, teamZh: teamZh(teamAbbr) || null,
       position: athlete.position ?? null,
       headshot: athlete.headshot ?? `https://a.espncdn.com/i/headshots/nba/players/full/${espnId}.png`,
-      height: athlete.height ?? null,
-      weight: athlete.weight ?? null,
-      age: athlete.age ?? null,
-      debutYear: athlete.debutYear ?? null,
-      draftText: athlete.draftText ?? null,
-      college: athlete.college ?? null,
-      experience: athlete.experience ?? null,
-      active: athlete.active ?? true,
-      currentSeason,
+      height: athlete.height ?? null, weight: athlete.weight ?? null, age: athlete.age ?? null,
+      debutYear: athlete.debutYear ?? null, draftText: athlete.draftText ?? null, college: athlete.college ?? null,
+      experience: athlete.experience ?? null, active: athlete.active ?? true,
+      currentSeason, requestedSeasonYear: year, currentSeasonYear: latestRegular?.seasonYear ?? null,
+      currentSeasonStatus: current ? current.provenance === "game-log" ? "game-log" : "official" :
+        officialResult.failed || logResult.failed ? "error" : "pending",
       careerRegular: regularSeasons.length ? aggregate(regularSeasons) : null,
       careerPlayoffs: playoffSeasons.length ? aggregate(playoffSeasons) : null,
-      seasons,
-      recentGames: overview?.recentGames ?? [],
-      awards: overview?.awards ?? [],
-      note: overview?.note ?? null,
-      source: "live",
-      fetchedAt: nowIso(),
+      seasons, recentGames: logResult.value?.recentGames.length ? logResult.value.recentGames : stale?.recentGames ?? [],
+      awards: overview?.awards ?? stale?.awards ?? [], note: overview?.note ?? stale?.note ?? null,
+      source: "live", fetchedAt: current?.source === "cache" && stale ? stale.fetchedAt : nowIso(),
+      ...(errors.length ? { error: errors.join(" ") } : {}),
     };
-    if (fullName) cacheSet(cacheKey, profile);
+    // 失败不能刷新成功缓存的时间戳，也不把“暂不可用”长期缓存。
+    if (fullName && !profile.error) cacheSet(cacheKey, profile);
     return profile;
   } catch {
-    if (stale) return { ...stale, source: "cache" };
+    if (stale) return { ...stale, source: "cache", error: "球员数据更新失败，当前展示上次成功获取的缓存。" };
     return {
-      espnId,
-      fullName: "",
-      shortName: null,
-      zhName: null,
-      teamAbbr: null,
-      teamName: null,
-      teamZh: null,
-      position: null,
-      headshot: null,
-      height: null,
-      weight: null,
-      age: null,
-      debutYear: null,
-      draftText: null,
-      college: null,
-      experience: null,
-      active: true,
-      currentSeason: null,
-      careerRegular: null,
-      careerPlayoffs: null,
-      seasons: [],
-      recentGames: [],
-      awards: [],
-      note: null,
-      source: "offline",
-      fetchedAt: nowIso(),
+      espnId, fullName: "", shortName: null, zhName: null, teamAbbr: null, teamName: null,
+      teamZh: null, position: null, headshot: null, height: null, weight: null, age: null,
+      debutYear: null, draftText: null, college: null, experience: null, active: true,
+      currentSeason: null, requestedSeasonYear: year, currentSeasonYear: null, currentSeasonStatus: "error",
+      careerRegular: null, careerPlayoffs: null, seasons: [], recentGames: [], awards: [], note: null,
+      source: "offline", fetchedAt: nowIso(), error: "球员数据暂时无法获取，请稍后重试。",
     };
   }
 }
@@ -543,43 +566,34 @@ export { currentNbaSeasonYear, seasonLabel };
 
 /* ------------------------------ 比赛详情 ------------------------------ */
 
-const GAME_DETAIL_TTL_POST_MS = 24 * 3600 * 1000; // 已结束：24 小时（结果基本不变，留一天余地）
-const GAME_DETAIL_TTL_IN_MS = 30 * 1000; // 直播中：30 秒
-const GAME_DETAIL_TTL_PRE_MS = 5 * 60 * 1000; // 未开赛：5 分钟
-
-function gameDetailTtl(detail: GameDetail): number {
-  if (detail.statusState === "post") return GAME_DETAIL_TTL_POST_MS;
-  if (detail.statusState === "in") return GAME_DETAIL_TTL_IN_MS;
-  return GAME_DETAIL_TTL_PRE_MS;
-}
-
-/** 按缓存内比赛自身的状态决定 TTL（已结束的比赛不应被 30 秒的直播 TTL 误伤） */
-function cacheGetGameDetail(key: string): GameDetail | null {
-  try {
-    const raw = window.localStorage.getItem(key);
-    if (!raw) return null;
-    const box = JSON.parse(raw) as CacheBox<GameDetail>;
-    if (typeof box.at !== "number" || !box.value) return null;
-    return Date.now() - box.at <= gameDetailTtl(box.value) ? box.value : null;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * 单场详情（逐节比分 / boxscore / 球队数据对比）。
  * 按比赛状态分级缓存；网络失败时回退到过期缓存，再没有则离线。
  */
-export async function getGameDetail(gameId: string): Promise<GameDetailResult> {
-  const key = `nba:game-detail:v3:${gameId}`; // v3：修复队标读取（header 里为 logos 数组）
-  const fresh = cacheGetGameDetail(key);
-  if (fresh) return { detail: fresh, source: "cache", fetchedAt: nowIso() };
-  try {
-    const detail = await fetchGameSummary(gameId);
-    cacheSet(key, detail);
-    return { detail, source: "live", fetchedAt: nowIso() };
-  } catch {
-    const stale = cacheGetStale<GameDetail>(key);
-    return { detail: stale, source: stale ? "cache" : "offline", fetchedAt: nowIso() };
+const detailInflight = new Map<string, Promise<GameDetailResult>>();
+
+export async function getGameDetail(gameId: string, options: RefreshOptions = {}): Promise<GameDetailResult> {
+  const key = `nba:game-detail:v4:beijing:${gameId}`;
+  const cached = readCacheBox<GameDetail>(key);
+  if (!options.force && cached && Date.now() - cached.at < gameDetailTtl(cached.value)) {
+    return { detail: cached.value, source: "cache", fetchedAt: new Date(cached.at).toISOString(),
+      incomplete: isGameDetailIncomplete(cached.value) };
   }
+  const pending = detailInflight.get(gameId);
+  if (pending) return pending;
+  const request = (async (): Promise<GameDetailResult> => {
+    try {
+      const detail = await fetchGameSummary(gameId);
+      cacheSet(key, detail);
+      return { detail, source: "live", fetchedAt: nowIso(), incomplete: isGameDetailIncomplete(detail) };
+    } catch {
+      return { detail: cached?.value ?? null, source: cached ? "cache" : "offline",
+        fetchedAt: cached ? new Date(cached.at).toISOString() : null, stale: Boolean(cached),
+        error: "暂时无法获取比赛详情，请稍后重试。",
+        incomplete: cached ? isGameDetailIncomplete(cached.value) : undefined };
+    }
+  })();
+  detailInflight.set(gameId, request);
+  request.finally(() => detailInflight.delete(gameId)).catch(() => {});
+  return request;
 }

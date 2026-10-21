@@ -1,5 +1,9 @@
+"use client";
+
 import Link from "next/link";
+import { useState } from "react";
 import type { GameSummary } from "@/lib/nba/types";
+import { gameTimeEn } from "@/lib/nba/dates";
 
 /**
  * 本场热点球员标签：两队得分王优先，篮板/助攻王补充，去重后最多 3 个。
@@ -31,8 +35,11 @@ function leaderText(game: GameSummary, side: "home" | "away", kind = "points") {
 export default function GameCard({ game }: { game: GameSummary }) {
   const live = game.statusState === "in";
   const pre = game.statusState === "pre";
-  const homeWin = (game.home.score ?? 0) > (game.away.score ?? 0);
-  const awayWin = (game.away.score ?? 0) > (game.home.score ?? 0);
+  const finished = game.completed && game.statusState === "post";
+  const hasWinner = game.home.winner !== game.away.winner;
+  const scoresKnown = game.home.score !== null && game.away.score !== null;
+  const homeWin = finished && (hasWinner ? game.home.winner : scoresKnown && game.home.score! > game.away.score!);
+  const awayWin = finished && (hasWinner ? game.away.winner : scoresKnown && game.away.score! > game.home.score!);
 
   return (
     <article className="panel flex flex-col gap-3 p-4">
@@ -40,13 +47,16 @@ export default function GameCard({ game }: { game: GameSummary }) {
         <span className="chip">
           {live ? "🔴 直播中" : pre ? "🕒 未开赛" : "🏁 已结束"}
         </span>
-        <span className="truncate text-slate-500">{game.statusDetail}</span>
+        <time dateTime={game.date} title="Beijing Time (GMT+8)" className="text-right text-slate-500">{gameTimeEn(game.date)}</time>
       </div>
+      {!pre && game.statusDetail ? <p className="text-[11px] text-slate-500">{game.statusDetail}</p> : null}
 
       <div className="flex items-center justify-between gap-3">
         <TeamRow
           name={game.away.name || game.away.abbr}
           abbr={game.away.abbr}
+          logo={game.away.logo}
+          side="away"
           score={game.away.score}
           record={game.away.record}
           win={awayWin}
@@ -56,6 +66,8 @@ export default function GameCard({ game }: { game: GameSummary }) {
         <TeamRow
           name={game.home.name || game.home.abbr}
           abbr={game.home.abbr}
+          logo={game.home.logo}
+          side="home"
           score={game.home.score}
           record={game.home.record}
           win={homeWin}
@@ -111,6 +123,8 @@ export default function GameCard({ game }: { game: GameSummary }) {
 function TeamRow({
   name,
   abbr,
+  logo,
+  side,
   score,
   record,
   win,
@@ -119,20 +133,30 @@ function TeamRow({
 }: {
   name: string;
   abbr: string;
+  logo: string | null;
+  side: "home" | "away";
   score: number | null;
   record: string | null;
   win: boolean;
   align?: "left" | "right";
   dim?: boolean;
 }) {
+  const [failedLogo, setFailedLogo] = useState<string | null>(null);
   return (
     <div className={`flex min-w-0 flex-1 items-center gap-2 ${align === "right" ? "flex-row-reverse text-right" : ""}`}>
-      <span
-        className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg text-[11px] font-bold ${
-          win ? "bg-orange-500/20 text-orange-300 ring-1 ring-orange-500/40" : "bg-slate-700/40 text-slate-300"
-        }`}
-      >
-        {abbr}
+      <span className="flex w-9 shrink-0 flex-col items-center gap-1">
+        <span
+          title={win ? `${name} · Winner` : name}
+          className={`grid h-9 w-9 place-items-center rounded-lg bg-slate-700/40 text-[11px] font-bold text-slate-300 ${
+            win ? "ring-2 ring-inset ring-green-500" : ""
+          }`}
+        >
+          {logo && failedLogo !== logo ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={logo} alt={`${name} logo`} className="h-full w-full object-contain p-1" onError={() => setFailedLogo(logo)} />
+          ) : abbr}
+        </span>
+        <span className="text-[9px] font-semibold leading-none tracking-wide text-slate-500">{side === "home" ? "HOME" : "AWAY"}</span>
       </span>
       <span className="min-w-0 flex-1">
         <span className="block truncate text-[13px] font-semibold text-slate-100">{name}</span>
