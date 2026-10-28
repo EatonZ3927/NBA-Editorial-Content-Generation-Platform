@@ -9,7 +9,7 @@
 本应用为**纯静态站点**，无需任何后端 / 数据库，可直接部署到 GitHub Pages：
 
 - **数据来源**：比分、新闻、联盟数据榜、球员档案与生涯数据均由访问者的浏览器**直连 ESPN 公开接口**获取（CORS 开放），缓存落在各自浏览器的 localStorage。
-- **AI 文案生成（BYOK）**：首次打开会引导填入自己的 **阿里云 DashScope API Key**（默认模型 deepseek-v4-flash）。Key 只保存在本人浏览器的 localStorage 中，点击「生成文案」时由浏览器直接请求 DashScope，不经过任何中转服务器。
+- **AI 文案生成（BYOK）**：首次打开会引导填入自己的 **阿里云 DashScope API Key**（默认模型 deepseek-v4.1-flash-1017，支持更长的 `sk-ws-` 新版密钥）。Key 仅保存在当前页面内存中，不写入 sessionStorage/localStorage，刷新、关闭标签页或离开本站后需重新填写，站内切换页面可继续使用；离开文档时还会清空内存引用。旧版浏览器存储中的密钥会尝试移除。页面恶意脚本或浏览器扩展仍可能读取使用中的密钥。生成时浏览器通过 HTTPS 直连 DashScope，不经过中转服务器；禁止通过公开环境变量打包统一密钥。
 - **草稿箱**：保存在本浏览器 localStorage，每个使用者各自一份。
 
 ## 功能
@@ -47,7 +47,7 @@ npm run test:players # 赛季滚动、新赛季汇总延迟、逐场兜底和缓
 
 ## 部署到 GitHub Pages
 
-一条命令完成构建 + 发布（会把静态站点强制推送到 `gh-pages` 分支）：
+一条命令完成构建 + 发布（仅发布静态文件到 `gh-pages` 分支，保留分支历史，不强制推送）：
 
 ```bash
 bash scripts/deploy-pages.sh
@@ -56,6 +56,8 @@ bash scripts/deploy-pages.sh
 首次使用需在仓库 **Settings → Pages → Source** 选择 **「Deploy from a branch」**，Branch 选 **`gh-pages` / (root)**。
 
 构建时通过环境变量 `PAGES_BASE_PATH=/<仓库名>` 注入子路径前缀（项目页路径）；本地开发无需设置。之后每次改动代码，重新运行上面的脚本即可更新线上页面。
+
+仅验证构建和发布提交、暂不推送：`bash scripts/deploy-pages.sh --prepare-only`。发布源码时只选择本次修改文件，不要将本地输出目录或任何密钥文件加入提交。
 
 ## 给编辑同事使用
 

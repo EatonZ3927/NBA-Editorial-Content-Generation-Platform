@@ -2,6 +2,7 @@
 
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
+import { getUserApiKey } from "@/lib/copy/key-storage";
 
 /**
  * 进门拦截：首次打开应用且既未保存 Key 也未选择跳过时，
@@ -14,7 +15,7 @@ export default function KeyGate() {
   useEffect(() => {
     if (pathname === "/setup-key") return;
     try {
-      const key = window.localStorage.getItem("dashscope_api_key");
+      const key = getUserApiKey();
       const dismissed = window.localStorage.getItem("dashscope_key_dismissed");
       if (!key && !dismissed) router.replace("/setup-key");
     } catch {

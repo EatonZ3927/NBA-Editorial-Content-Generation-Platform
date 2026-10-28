@@ -17,7 +17,7 @@ export type GenerateInput = {
   seasonYear?: number | null;
   /** false 时强制走本地模板引擎（用于对比/兜底） */
   useAi?: boolean;
-  /** 用户自有 DashScope Key（BYOK），优先于服务端环境变量 */
+  /** 用户自有 DashScope Key（BYOK），由当前页面内存提供 */
   userApiKey?: string | null;
 };
 

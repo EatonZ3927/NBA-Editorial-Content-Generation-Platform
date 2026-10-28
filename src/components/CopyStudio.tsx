@@ -4,7 +4,7 @@ import { todayIso } from "@/lib/nba/dates";
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getUserApiKey } from "@/components/KeySetup";
+import { getUserApiKey } from "@/lib/copy/key-storage";
 import {
   LENGTHS,
   TEMPLATES,
@@ -679,7 +679,7 @@ export default function CopyStudio({ initial }: { initial: CopyStudioInitial }) 
             🧩 AI 未启用或调用失败，本次已自动回退到本地模板引擎。原因：{result.aiError}
             <br />
             可前往 <Link href="/setup-key" className="text-orange-300 underline underline-offset-2 hover:text-orange-200">🔑 密钥设置</Link> 填入你的
-            DashScope Key 立即启用（Key 只保存在你自己的浏览器中）。
+            DashScope Key 后重试（Key 仅保存在当前页面内存中，刷新或关闭后需重新填写）。
           </div>
         ) : null}
 

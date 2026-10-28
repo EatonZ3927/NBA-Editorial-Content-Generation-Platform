@@ -2,53 +2,44 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
+import { clearUserApiKey, getUserApiKey, saveUserApiKey } from "@/lib/copy/key-storage";
 
-const KEY_STORAGE = "dashscope_api_key";
 const DISMISS_STORAGE = "dashscope_key_dismissed";
-
-export function getUserApiKey(): string {
-  try {
-    return window.localStorage.getItem(KEY_STORAGE) ?? "";
-  } catch {
-    return "";
-  }
-}
 
 /**
  * DashScope API Key 设置页（纯前端 BYOK）：
- * key 只保存在用户自己的浏览器 localStorage 中；
+ * key 只保存在当前页面内存中；
  * 生成文案时由本浏览器直接请求 DashScope，不经过任何中转服务器。
  */
 export default function KeySetup() {
   const router = useRouter();
   const [value, setValue] = useState("");
-  const [saved, setSaved] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    try {
-      const existing = window.localStorage.getItem(KEY_STORAGE);
-      if (existing) setSaved(existing);
-    } catch {
-      // localStorage 不可用时按未设置处理
-    }
-    setReady(true);
+    let active = true;
+    // 客户端挂载完成后读取浏览器存储，避免服务端与首帧不一致。
+    queueMicrotask(() => {
+      if (!active) return;
+      setSaved(Boolean(getUserApiKey()));
+      setReady(true);
+    });
+    const onPageHide = () => { setSaved(false); setValue(""); };
+    window.addEventListener("pagehide", onPageHide);
+    return () => { active = false; window.removeEventListener("pagehide", onPageHide); };
   }, []);
 
   const save = () => {
-    const key = value.trim();
-    if (!/^sk-[A-Za-z0-9-]{8,64}$/.test(key)) {
-      setError("Key 格式不正确：应以 sk- 开头，长度为 11~67 位（字母、数字、短横线）");
-      return;
-    }
     try {
-      window.localStorage.setItem(KEY_STORAGE, key);
-      window.localStorage.removeItem(DISMISS_STORAGE);
-    } catch {
-      setError("浏览器存储不可用，请检查隐私模式设置");
+      saveUserApiKey(value);
+    } catch (e) {
+      setError(e instanceof Error && e.name === "Error" ? e.message : "浏览器会话存储不可用，请检查隐私设置");
       return;
     }
+    setValue("");
+    try { window.localStorage.removeItem(DISMISS_STORAGE); } catch { /* 不影响已保存的会话密钥 */ }
     router.replace("/");
   };
 
@@ -63,12 +54,14 @@ export default function KeySetup() {
 
   const clear = () => {
     try {
-      window.localStorage.removeItem(KEY_STORAGE);
-    } catch {
-      // 忽略
+      clearUserApiKey();
+    } catch (e) {
+      setError((e as Error).message);
+      return;
     }
-    setSaved(null);
+    setSaved(false);
     setValue("");
+    setError(null);
   };
 
   if (!ready) return null;
@@ -89,7 +82,7 @@ export default function KeySetup() {
 
         {saved ? (
           <div className="flex items-center justify-between rounded-xl border border-emerald-300 bg-emerald-100 px-4 py-3 text-[13px] font-medium text-emerald-950">
-            <span>✅ 已保存 Key</span>
+            <span>✅ Key 仅保存在当前页面内存中</span>
             <button
               type="button"
               onClick={clear}
@@ -102,20 +95,23 @@ export default function KeySetup() {
 
         <div className="space-y-2">
           <input
+            type="password"
+            aria-label="DashScope API Key"
             value={value}
             onChange={(e) => {
               setValue(e.target.value);
               setError(null);
             }}
-            placeholder={saved ? "输入新 Key 以更换" : "sk-xxxxxxxxxxxxxxxx"}
+            placeholder={saved ? "输入完整新 Key 以更换" : "sk-… 或 sk-ws-…（支持长密钥）"}
             className="field font-mono !text-[13px]"
             autoComplete="off"
             spellCheck={false}
           />
           {error ? <p className="text-[12px] text-rose-400">{error}</p> : null}
           <p className="text-[11px] leading-relaxed text-slate-500">
-            Key 仅保存在你自己的浏览器（localStorage）中；点击「生成文案」时由你的浏览器直接请求
-            DashScope，不经过任何中转服务器，本站也不存储。没有 Key？{" "}
+            Key 仅保存在当前页面内存中，不写入浏览器存储。刷新、关闭标签页或离开本站后需重新填写。
+            站内切换页面可继续使用；清除按钮可立即移除。页面内运行的恶意脚本或浏览器扩展仍可能读取使用中的密钥。
+            生成时仅通过 HTTPS 直接发送给 DashScope。没有 Key？{" "}
             <a
               href="https://bailian.console.aliyun.com/?apiKey=1#/api-key"
               target="_blank"

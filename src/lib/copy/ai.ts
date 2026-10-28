@@ -20,18 +20,17 @@ export type AiInput = {
   ctx: CopyContext;
   keywords?: string;
   variant?: number;
-  /** 用户在设置页填入的自有 DashScope Key（BYOK），优先于服务端环境变量 */
+  /** 用户在设置页填入的自有 DashScope Key（BYOK） */
   userApiKey?: string | null;
 };
 
 function aiConfig(userApiKey?: string | null) {
-  // 纯前端 BYOK 架构：优先使用用户在「密钥设置」页填入的 DashScope Key（存于本浏览器 localStorage）；
-  // NEXT_PUBLIC_* 环境变量仅作为部署者给全站访客准备的兜底（一般留空）。
-  const apiKey = (userApiKey ?? "").trim() || (process.env.NEXT_PUBLIC_OPENAI_API_KEY ?? "").trim();
+  // 只使用用户页面内存中的密钥，禁止将部署者密钥编译到公开网页脚本。
+  const apiKey = (userApiKey ?? "").trim();
   const baseUrl =
     (process.env.NEXT_PUBLIC_OPENAI_BASE_URL ?? "").trim().replace(/\/+$/, "") ||
     "https://dashscope.aliyuncs.com/compatible-mode/v1";
-  const model = (process.env.NEXT_PUBLIC_OPENAI_MODEL ?? "").trim() || "deepseek-v4-flash";
+  const model = (process.env.NEXT_PUBLIC_OPENAI_MODEL ?? "").trim() || "deepseek-v4.1-flash-1017";
   const jsonMode = (process.env.NEXT_PUBLIC_OPENAI_JSON_MODE ?? "true").trim().toLowerCase() !== "false";
   return { apiKey, baseUrl, model, jsonMode };
 }
